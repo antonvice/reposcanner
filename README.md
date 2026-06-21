@@ -1,8 +1,8 @@
 # reposcanner
 
-`reposcanner` is a small CLI for generating one repository metadata row for code dataset QA.
+`reposcanner` is a small CLI for generating one repository metadata row for code dataset QA and repository sale preparation.
 
-It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. The CLI uses `rich` for progress, logs, and summary tables.
+It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. The CLI uses `rich` for progress, logs, summary tables, and a sale-fit HUD.
 
 ## Install
 
@@ -83,6 +83,11 @@ Default schema is `extended`. It emits the base metadata columns plus useful loc
 - `token_stats.estimated_text_tokens`
 - `token_stats.tokens_by_language`
 - `token_stats.tokens_by_extension`
+- `sale_prediction.tier`
+- `sale_prediction.sale_probability`
+- `sale_prediction.similarity_to_sold`
+
+The bundled sale-fit model is trained on repositories that were previously sold. It runs locally with the package; there is no separate service call. Repositories with `similarity_to_sold >= 0.85` are reported as Tier 1 / high probability of sale, `>= 0.70` as Tier 2 / promising, and the rest as Tier 3 / standard.
 
 Use `--schema core` when you want only the source metadata columns:
 
@@ -126,6 +131,12 @@ sample_loc
 For `primary_language`, it intentionally skips non-primary data/markup/style languages when a real programming language exists. For example, if YAML, JSON, or CSS is the largest bucket but Python or JavaScript is also present, the scanner picks the real programming language instead of reporting YAML/JSON/CSS as primary.
 
 The language distribution still includes counted languages that pass the 1% threshold, including JSON/YAML/CSS. Only the primary-language choice is adjusted.
+
+## Fair LOC Counting
+
+Dependency, virtual environment, package cache, and build output directories are skipped during traversal. This includes common folders such as `.venv`, `.vwnv`, `venv`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.nuxt`, `.gradle`, `.m2`, `Pods`, `DerivedData`, `target`, `bin`, and `obj`.
+
+Those files do not contribute to raw LOC, logical LOC, source file count, language distribution, token estimates, or sale-fit scoring.
 
 ## Token Estimates
 

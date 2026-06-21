@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 import subprocess
@@ -78,22 +79,50 @@ METADATA_COLUMNS = [
 DEPENDENCY_DIRS = {
     "node_modules",
     "vendor",
+    "vendors",
     "dist",
     "build",
+    "coverage",
     "bower_components",
     ".venv",
+    ".vwnv",
     "venv",
     "env",
+    ".env",
+    "virtualenv",
     "__pycache__",
     ".tox",
     ".mypy_cache",
     ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    ".parcel-cache",
+    ".turbo",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".serverless",
     "target",
     "bin",
     "obj",
     "packages",
     "PackageCache",
+    "packagecache",
     ".gradle",
+    "gradle",
+    ".m2",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    "Pods",
+    "Carthage",
+    "DerivedData",
+    "cmake-build-debug",
+    "cmake-build-release",
+    "Debug",
+    "Release",
+    "x64",
+    "x86",
 }
 
 ALWAYS_SKIP_DIRS = {
@@ -362,6 +391,10 @@ class ScanHud(AbstractContextManager["ScanHud"]):
             else "not requested"
         )
         overview.add_row("Estimated code tokens", token_display)
+        sale_prediction = row.get("sale_prediction")
+        if isinstance(sale_prediction, dict):
+            overview.add_row("Sale probability", f"{sale_prediction.get('sale_probability', 0):.1%}")
+            overview.add_row("Model tier", f"Tier {sale_prediction.get('tier')} ({sale_prediction.get('label')})")
         self.console.print(Panel(overview, title="Scan Summary", border_style="green", box=box.ROUNDED))
 
         if lang_loc:
@@ -417,7 +450,10 @@ def iter_candidate_files(repo: Path) -> Iterable[Path]:
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in ALWAYS_SKIP_DIRS and not d.startswith(".cache")
+            if d not in ALWAYS_SKIP_DIRS
+            and d not in DEPENDENCY_DIRS
+            and not d.endswith(".egg-info")
+            and not d.startswith(".cache")
         ]
         for name in filenames:
             path = Path(dirpath) / name
@@ -520,6 +556,23 @@ def rounded_distribution(counter: Counter[str], total: int) -> dict[str, float]:
         if value > 0 and value / total >= 0.01
     }
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+
+
+def parse_distribution(value: Any) -> dict[str, float]:
+    if isinstance(value, dict):
+        return {str(k): float(v or 0) for k, v in value.items()}
+    if value is None:
+        return {}
+    text = str(value).strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): float(v or 0) for k, v in data.items()}
 
 
 def choose_primary_language(lang_loc: Counter[str]) -> str:
@@ -868,6 +921,103 @@ def token_stats(stats: list[FileStat]) -> dict[str, Any]:
     }
 
 
+def load_sale_model() -> dict[str, Any] | None:
+    model_path = Path(__file__).with_name("sale_model.json")
+    if not model_path.exists():
+        return None
+    try:
+        return json.loads(model_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def sale_model_vector(row: dict[str, Any], model: dict[str, Any]) -> list[float]:
+    weights = model.get("group_weights", {})
+    numeric_weight = float(weights.get("numeric", 1.0))
+    language_weight = float(weights.get("language", 1.0))
+    categorical_weight = float(weights.get("categorical", 1.0))
+    vector: list[float] = []
+
+    for column in model.get("numeric_columns", []):
+        stats = model.get("numeric_stats", {}).get(column, {})
+        median = float(stats.get("median", 0.0))
+        scale = max(float(stats.get("scale", 1.0)), 1e-6)
+        value = row.get(column)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = median
+        if stats.get("log1p", False):
+            number = math.log1p(max(number, 0.0))
+        vector.append(((number - median) / scale) * numeric_weight)
+
+    distribution = parse_distribution(row.get("lang_distribution"))
+    primary_language = str(row.get("primary_language") or "")
+    for language in model.get("languages", []):
+        value = float(distribution.get(language, 0.0))
+        if primary_language == language:
+            value += 0.35
+        vector.append(value * language_weight)
+
+    for column in model.get("categorical_columns", []):
+        value = str(row.get(column) or "")
+        for expected in model.get("categorical_values", {}).get(column, []):
+            vector.append((1.0 if value == expected else 0.0) * categorical_weight)
+
+    return vector
+
+
+def mean_k_distance(vector: list[float], references: list[list[float]], k: int) -> float:
+    if not references:
+        return 0.0
+    distances = []
+    for ref in references:
+        size = min(len(vector), len(ref))
+        distance = math.sqrt(sum((vector[i] - float(ref[i])) ** 2 for i in range(size)))
+        distances.append(distance)
+    distances.sort()
+    k = max(1, min(k, len(distances)))
+    return sum(distances[:k]) / k
+
+
+def predict_sale(row: dict[str, Any]) -> dict[str, Any] | None:
+    model = load_sale_model()
+    if not model:
+        return None
+    vector = sale_model_vector(row, model)
+    labels = model.get("reference_labels", [])
+    references = model.get("reference_vectors", [])
+    sold_refs = [ref for ref, label in zip(references, labels, strict=False) if int(label) == 1]
+    background_refs = [ref for ref, label in zip(references, labels, strict=False) if int(label) == 0]
+    k = int(model.get("k", 5))
+    temperature = max(float(model.get("temperature", 1.0)), 1e-6)
+    sold_distance = mean_k_distance(vector, sold_refs, k)
+    background_distance = mean_k_distance(vector, background_refs, k)
+    raw = max(min((background_distance - sold_distance) / temperature, 50.0), -50.0)
+    probability = 1.0 / (1.0 + math.exp(-raw))
+    thresholds = model.get("thresholds", {})
+    tier_1 = float(thresholds.get("tier_1_similarity", 0.85))
+    tier_2 = float(thresholds.get("tier_2_similarity", 0.70))
+    if probability >= tier_1:
+        tier = 1
+        label = "high probability of sale"
+    elif probability >= tier_2:
+        tier = 2
+        label = "promising"
+    else:
+        tier = 3
+        label = "standard"
+    return {
+        "tier": tier,
+        "label": label,
+        "sale_probability": round(probability, 4),
+        "similarity_to_sold": round(probability, 4),
+        "nearest_sold_distance": round(sold_distance, 4),
+        "nearest_background_distance": round(background_distance, 4),
+        "model_version": model.get("version"),
+    }
+
+
 def build_metadata(
     repo: Path,
     repo_id: str,
@@ -875,6 +1025,7 @@ def build_metadata(
     sample_loc_override: int | None = None,
     *,
     include_token_stats: bool = False,
+    include_sale_prediction: bool = True,
     description: str | None = None,
     hud: ScanHud | None = None,
 ) -> dict:
@@ -969,6 +1120,12 @@ def build_metadata(
         if hud:
             hud.log("Estimating code tokens")
         row["token_stats"] = token_stats(no_deps)
+    if include_sale_prediction:
+        if hud:
+            hud.log("Scoring sale probability")
+        prediction = predict_sale(row)
+        if prediction:
+            row["sale_prediction"] = prediction
     if hud:
         hud.complete("metrics")
         hud.summary(row, stats)
@@ -1044,6 +1201,7 @@ def scan_command(args: argparse.Namespace) -> int:
             bundle_path,
             args.sample_loc,
             include_token_stats=args.schema == "extended",
+            include_sale_prediction=args.schema == "extended",
             description=description,
             hud=hud,
         )
