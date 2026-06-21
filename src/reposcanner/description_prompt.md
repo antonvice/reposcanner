@@ -1,10 +1,11 @@
 # Codex Prompt: Repository Description
 
-You are inside a software repository. Inspect the repository and write a concise customer-facing description of what this repository is.
+You are inside a software repository with an agent or local harness that can inspect files, search through the repo, and run read-only commands. Inspect the repository and write a concise customer-facing description of what this repository is.
 
 This description will be included in repository sale-evaluation metadata, so it must be accurate, specific, and safe to share after anonymization.
 
 Requirements:
+- Use this prompt only with an agent/harness that has repository access. Do not guess from a pasted filename or a plain chat context.
 - Output only one paragraph, 2-4 sentences.
 - Describe the product/domain, main user-facing purpose, and the most important technical components.
 - Mention the primary programming language/frameworks only if they are actually central to the repo.

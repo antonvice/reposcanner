@@ -328,7 +328,9 @@ reposcanner description-prompt
 
 Paste that prompt into Codex while Codex is opened inside the target repository. It asks Codex to inspect README files, manifests, entrypoints, and top-level directories, then produce a short paragraph without mentioning internal delivery process.
 
-You can also use a local model through tools such as Ollama, LM Studio, llama.cpp, or any other local inference setup. That keeps repository contents on your machine. Save the generated paragraph to a file, review/anonymize it, then include it in the scan:
+Use the prompt with an agent or harness that can actually inspect the repository, search files, and run read-only commands. Do not use a plain chat model that only sees the prompt and cannot access the repo; it will guess and produce weaker metadata.
+
+You can also use a local model through tools such as Ollama, LM Studio, llama.cpp, or any other local inference setup, as long as it is connected to a repo-aware agent/harness. That keeps repository contents on your machine. Save the generated paragraph to a file, review/anonymize it, then include it in the scan:
 
 ```bash
 reposcanner . --description-file repo_description.txt
