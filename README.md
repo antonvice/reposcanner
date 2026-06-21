@@ -28,7 +28,7 @@ For a repository to be a strong sale candidate:
 - It must be private or internal. Public/open-source repositories are not accepted for this sale path.
 - The prepared sample must be anonymized before sending.
 
-If the report says Tier 1 / high probability of sale, email `hello@grably.us` at GRABLY Inc. with a short note that you would like to sell the repository and work out a deal. Attach the anonymized sample zip. Without the sample, GRABLY cannot evaluate it.
+If the report says Tier 1 / high probability of sale, email `hello@grably.us` at GRABLY Inc. with a short note that you would like to sell the repository and work out a deal. Attach both generated files from `reposcanner_out/`: the anonymized sample zip and `metadata.json`. Without the sample and metadata, GRABLY cannot evaluate it.
 
 ## No Source-Code APIs
 
@@ -51,6 +51,8 @@ reposcanner_out/
   metadata.json
   {repo_id}_sample.zip
 ```
+
+If `metadata.json` reports Tier 1 / high probability of sale, email `hello@grably.us` and attach both files: `metadata.json` and the anonymized sample zip.
 
 You can also pass a path:
 
