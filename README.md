@@ -4,6 +4,8 @@
 
 It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. The CLI uses `rich` for progress, logs, summary tables, and a sale-fit HUD.
 
+If the analysis reports Tier 1 / high probability of sale, email `hello@grably.us` at GRABLY Inc. with a short note that you would like to sell the repository and work out a deal. Attach the prepared sample zip to that message; without the sample, GRABLY cannot evaluate it. The repository and sample must be anonymized before creating or sending the sample.
+
 ## Install
 
 From GitHub:
@@ -75,6 +77,12 @@ Disable the HUD for scripts or CI:
 reposcanner scan --repo . --no-hud --format jsonl
 ```
 
+Prepare a code sample zip after anonymizing the repository:
+
+```bash
+reposcanner scan --repo . --prep-sample --sample-output ./out --pretty --output repo_metadata.json
+```
+
 ## Output Schemas
 
 Default schema is `extended`. It emits the base metadata columns plus useful local extras:
@@ -137,6 +145,29 @@ The language distribution still includes counted languages that pass the 1% thre
 Dependency, virtual environment, package cache, and build output directories are skipped during traversal. This includes common folders such as `.venv`, `.vwnv`, `venv`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.nuxt`, `.gradle`, `.m2`, `Pods`, `DerivedData`, `target`, `bin`, and `obj`.
 
 Those files do not contribute to raw LOC, logical LOC, source file count, language distribution, token estimates, or sale-fit scoring.
+
+## Preparing A Sample
+
+`--prep-sample` creates a customer-facing sample zip shaped like:
+
+```text
+data/{repo_id}/
+  repo_summary.md
+  metadata.json
+  sample_quality.json
+  sample_manifest.json
+  samples/
+    ...
+```
+
+Important: anonymize the repository before running `--prep-sample`. Remove company names, customer names, secrets, proprietary hostnames, private URLs, credentials, personal data, and any other identifying information first. The generated sample is intended to be attached to the email to GRABLY only after that anonymization step.
+
+The sample QA mirrors the repository sale pipeline:
+
+- `PASS`: at least 5,000 counted lines in the primary programming language.
+- `PASS_UNDER_5K_ABOVE_1K`: 1,000-4,999 counted primary-language lines.
+- `PASS_SMALL_WHOLE_PROJECT`: small repositories where the sample is close to the whole repo (`logical_loc <= 6,500` and either at least 80% of logical LOC or within 500 LOC).
+- Fail statuses explain whether the primary language was missing, absent from the sample, too small, or not close enough to the whole repo.
 
 ## Token Estimates
 

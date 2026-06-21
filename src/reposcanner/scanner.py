@@ -22,17 +22,24 @@ import re
 import subprocess
 import sys
 import uuid
+import zipfile
 from collections import Counter
+from collections import deque
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from rich import box
+from rich.align import Align
 from rich.console import Console
+from rich.console import Group
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskID,
@@ -40,6 +47,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
+from rich.text import Text
 
 
 METADATA_COLUMNS = [
@@ -74,6 +82,12 @@ METADATA_COLUMNS = [
     "comment_ratio",
     "sample_loc",
 ]
+
+TARGET_MIN_PRIMARY_LANGUAGE_LOC = 5000
+UNDER_FAIL_MIN_PRIMARY_LANGUAGE_LOC = 1000
+SMALL_REPO_CLOSE_RATIO = 0.80
+SMALL_REPO_MAX_LOGICAL_LOC = 6500
+SMALL_REPO_ABS_TOLERANCE = 500
 
 
 DEPENDENCY_DIRS = {
@@ -313,102 +327,187 @@ class ScanHud(AbstractContextManager["ScanHud"]):
         self.enabled = enabled
         self.console = Console(stderr=True)
         self.progress: Progress | None = None
+        self.live: Live | None = None
         self._tasks: dict[str, TaskID] = {}
+        self._logs: deque[str] = deque(maxlen=8)
+        self._row: dict[str, Any] = {}
+        self._stats: list[FileStat] = []
+        self._stage = "warming up"
 
     def __enter__(self) -> "ScanHud":
         if self.enabled:
-            self.console.print(
-                Panel.fit(
-                    "[bold cyan]reposcanner[/bold cyan]\n"
-                    "[dim]local repository metadata scan[/dim]",
-                    border_style="cyan",
-                    box=box.ROUNDED,
-                )
-            )
             self.progress = Progress(
-                SpinnerColumn("dots"),
-                TextColumn("[progress.description]{task.description}"),
+                SpinnerColumn("dots12", style="bold magenta"),
+                TextColumn("[bold cyan]{task.description}"),
                 BarColumn(bar_width=None),
-                TextColumn("[bold]{task.completed}/{task.total}"),
+                MofNCompleteColumn(),
                 TimeElapsedColumn(),
                 console=self.console,
                 transient=False,
+                expand=True,
             )
             self.progress.start()
+            self.live = Live(
+                self.render(),
+                console=self.console,
+                refresh_per_second=8,
+                transient=False,
+                vertical_overflow="ellipsis",
+            )
+            self.live.start()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self.enabled and exc:
+            self._stage = "failed"
+            self.log(f"[bold red]scan failed[/bold red] {exc}")
+            self.refresh()
+        elif self.enabled:
+            self._stage = "complete"
+            self.refresh()
+        if self.live:
+            self.live.stop()
         if self.progress:
             self.progress.stop()
-        if self.enabled and exc:
-            self.console.print(
-                Panel.fit(
-                    f"[bold red]scan failed[/bold red]\n{exc}",
-                    border_style="red",
-                    box=box.ROUNDED,
-                )
-            )
+
+    def refresh(self) -> None:
+        if self.live:
+            self.live.update(self.render(), refresh=True)
+
+    def render(self) -> Panel:
+        return Panel(
+            self.layout(),
+            title="[bold white]reposcanner[/bold white] [dim]metadata + sale-fit scanner[/dim]",
+            subtitle=f"[dim]{self._stage}[/dim]",
+            border_style="bright_magenta",
+            box=box.DOUBLE_EDGE,
+        )
+
+    def layout(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(self.header(), name="header", size=5),
+            Layout(name="main", ratio=1),
+            Layout(self.progress_panel(), name="progress", size=6),
+        )
+        layout["main"].split_row(
+            Layout(self.metrics_panel(), name="metrics", ratio=2),
+            Layout(name="right", ratio=3),
+        )
+        layout["right"].split_column(
+            Layout(self.language_panel(), name="languages", ratio=2),
+            Layout(self.log_panel(), name="logs", ratio=1),
+        )
+        return layout
+
+    def header(self) -> Panel:
+        title = Text("Repository Sale Prep Console", style="bold bright_cyan")
+        subtitle = Text("fair LOC • primary language QA • token stats • sale-fit model", style="dim")
+        pulse = Text("◆ " * 18, style="magenta")
+        return Panel(Align.center(Group(title, subtitle, pulse)), border_style="cyan", box=box.ROUNDED)
+
+    def metrics_panel(self) -> Panel:
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold cyan")
+        table.add_column(justify="right")
+        row = self._row
+        table.add_row("Primary", str(row.get("primary_language") or "scanning..."))
+        table.add_row("Logical LOC", self.format_int(row.get("logical_loc")))
+        table.add_row("Raw LOC", self.format_int(row.get("raw_loc")))
+        table.add_row("Files", self.format_int(row.get("source_files")))
+        table.add_row("Code tokens", self.token_display(row))
+        sale_prediction = row.get("sale_prediction")
+        if isinstance(sale_prediction, dict):
+            probability = float(sale_prediction.get("sale_probability", 0))
+            tier = sale_prediction.get("tier")
+            label = sale_prediction.get("label")
+            table.add_row("Sale prob", f"[bold]{probability:.1%}[/bold]")
+            table.add_row("Tier", f"[bold magenta]{tier}[/bold magenta] [dim]{label}[/dim]")
+        sample = row.get("sample_quality")
+        if isinstance(sample, dict):
+            style = "green" if str(sample.get("status", "")).startswith("PASS") else "red"
+            table.add_row("Sample QA", f"[{style}]{sample.get('status')}[/{style}]")
+            table.add_row("Sample LOC", self.format_int(sample.get("counted_primary_language_loc")))
+        return Panel(table, title="Vitals", border_style="green", box=box.ROUNDED)
+
+    def language_panel(self) -> Panel:
+        lang_loc: Counter[str] = Counter()
+        for stat in self._stats:
+            if not stat.dependency and stat.code_loc > 0:
+                lang_loc[stat.language] += stat.code_loc
+        table = Table(box=box.SIMPLE_HEAVY, expand=True, show_edge=False)
+        table.add_column("Language", style="bold")
+        table.add_column("LOC", justify="right")
+        table.add_column("Share", justify="right")
+        table.add_column("Spark")
+        if not lang_loc:
+            table.add_row("scanning", "-", "-", "[dim]waiting for files[/dim]")
+        else:
+            total = sum(lang_loc.values())
+            palette = ["bright_cyan", "bright_magenta", "green", "yellow", "blue", "red"]
+            for index, (language, loc) in enumerate(sorted(lang_loc.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:8]):
+                share = loc / total if total else 0
+                width = max(1, round(share * 28))
+                color = palette[index % len(palette)]
+                table.add_row(language, f"{loc:,}", f"{share:.1%}", f"[{color}]{'█' * width}[/{color}]")
+        return Panel(table, title="Language Signal", border_style="bright_blue", box=box.ROUNDED)
+
+    def log_panel(self) -> Panel:
+        lines = list(self._logs) or ["[dim]logs will appear here[/dim]"]
+        return Panel("\n".join(lines), title="Scan Log", border_style="yellow", box=box.ROUNDED)
+
+    def progress_panel(self) -> Panel:
+        renderable = self.progress if self.progress else Text("progress initializing", style="dim")
+        return Panel(renderable, title="Pipeline", border_style="bright_black", box=box.ROUNDED)
+
+    @staticmethod
+    def format_int(value: Any) -> str:
+        try:
+            return f"{int(value):,}"
+        except (TypeError, ValueError):
+            return "-"
+
+    @staticmethod
+    def token_display(row: dict[str, Any]) -> str:
+        token_stats_row = row.get("token_stats")
+        if isinstance(token_stats_row, dict):
+            return f"{token_stats_row.get('estimated_code_tokens', 0):,}"
+        return "not requested"
 
     def log(self, message: str) -> None:
         if self.enabled:
-            self.console.log(message)
+            self._logs.append(message)
+            self.refresh()
 
     def task(self, key: str, description: str, total: int) -> None:
         if not self.progress:
             return
         total = max(total, 1)
         self._tasks[key] = self.progress.add_task(description, total=total)
+        self._stage = description
+        self.refresh()
 
     def advance(self, key: str, amount: int = 1) -> None:
         if self.progress and key in self._tasks:
             self.progress.advance(self._tasks[key], amount)
+            task = self.progress.tasks[self._tasks[key]]
+            if int(task.completed) % 25 == 0 or task.completed >= task.total:
+                self.refresh()
 
     def complete(self, key: str) -> None:
         if self.progress and key in self._tasks:
             task_id = self._tasks[key]
             task = self.progress.tasks[task_id]
             self.progress.update(task_id, completed=task.total)
+            self.refresh()
 
     def summary(self, row: dict, stats: list[FileStat]) -> None:
         if not self.enabled:
             return
-        lang_loc: Counter[str] = Counter()
-        for stat in stats:
-            if not stat.dependency and stat.code_loc > 0:
-                lang_loc[stat.language] += stat.code_loc
-
-        overview = Table.grid(padding=(0, 2))
-        overview.add_column(style="bold cyan")
-        overview.add_column(justify="right")
-        overview.add_row("Primary language", str(row.get("primary_language") or ""))
-        overview.add_row("Logical LOC", f"{row.get('logical_loc', 0):,}")
-        overview.add_row("Raw LOC", f"{row.get('raw_loc', 0):,}")
-        overview.add_row("Source files", f"{row.get('source_files', 0):,}")
-        token_stats_row = row.get("token_stats")
-        token_display = (
-            f"{token_stats_row.get('estimated_code_tokens', 0):,}"
-            if isinstance(token_stats_row, dict)
-            else "not requested"
-        )
-        overview.add_row("Estimated code tokens", token_display)
-        sale_prediction = row.get("sale_prediction")
-        if isinstance(sale_prediction, dict):
-            overview.add_row("Sale probability", f"{sale_prediction.get('sale_probability', 0):.1%}")
-            overview.add_row("Model tier", f"Tier {sale_prediction.get('tier')} ({sale_prediction.get('label')})")
-        self.console.print(Panel(overview, title="Scan Summary", border_style="green", box=box.ROUNDED))
-
-        if lang_loc:
-            total = sum(lang_loc.values())
-            table = Table(title="Language Lines", box=box.SIMPLE_HEAVY)
-            table.add_column("Language", style="bold")
-            table.add_column("LOC", justify="right")
-            table.add_column("Share", justify="right")
-            table.add_column("Distribution")
-            for language, loc in sorted(lang_loc.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:8]:
-                share = loc / total if total else 0
-                bar = "█" * max(1, round(share * 24))
-                table.add_row(language, f"{loc:,}", f"{share:.1%}", f"[cyan]{bar}[/cyan]")
-            self.console.print(table)
+        self._row = row
+        self._stats = stats
+        self._stage = "finalizing"
+        self.refresh()
 
 
 def run(cmd: list[str], cwd: Path) -> str:
@@ -921,6 +1020,169 @@ def token_stats(stats: list[FileStat]) -> dict[str, Any]:
     }
 
 
+def close_enough_to_whole_repo(target_lines: int, logical_loc: int) -> bool:
+    if logical_loc <= 0 or target_lines <= 0:
+        return False
+    ratio = target_lines / logical_loc
+    return (
+        logical_loc <= SMALL_REPO_MAX_LOGICAL_LOC
+        and (ratio >= SMALL_REPO_CLOSE_RATIO or abs(logical_loc - target_lines) <= SMALL_REPO_ABS_TOLERANCE)
+    )
+
+
+def sample_quality(primary_language: str, primary_lines: int, logical_loc: int) -> dict[str, Any]:
+    if primary_lines >= TARGET_MIN_PRIMARY_LANGUAGE_LOC:
+        status = "PASS"
+        reason = f"{primary_lines} counted {primary_language} lines meets 5,000+ target."
+    elif primary_lines >= UNDER_FAIL_MIN_PRIMARY_LANGUAGE_LOC:
+        status = "PASS_UNDER_5K_ABOVE_1K"
+        reason = (
+            f"{primary_lines} counted {primary_language} lines is below the 5,000 target, "
+            "but above the 1,000-line failure floor."
+        )
+    elif close_enough_to_whole_repo(primary_lines, logical_loc):
+        status = "PASS_SMALL_WHOLE_PROJECT"
+        reason = (
+            f"Only {primary_lines} counted {primary_language} lines, but logical_loc is {logical_loc}; "
+            "sample primary-language LOC is close to the whole repo."
+        )
+    elif not primary_language:
+        status = "FAIL_UNKNOWN_PRIMARY_LANGUAGE"
+        reason = "Could not infer primary_language."
+    elif primary_lines == 0:
+        status = "FAIL_NO_PRIMARY_LANGUAGE_LINES"
+        reason = f"Primary language is {primary_language}, but sample has 0 counted {primary_language} lines."
+    elif logical_loc <= SMALL_REPO_MAX_LOGICAL_LOC:
+        status = "FAIL_SMALL_REPO_NOT_CLOSE_ENOUGH"
+        reason = (
+            f"Only {primary_lines} counted {primary_language} lines and logical_loc is {logical_loc}; "
+            f"sample is not close enough to whole repo threshold ({SMALL_REPO_CLOSE_RATIO:.0%} or within "
+            f"{SMALL_REPO_ABS_TOLERANCE} LOC)."
+        )
+    else:
+        status = "FAIL_UNDER_PRIMARY_LANGUAGE_TARGET"
+        reason = (
+            f"Only {primary_lines} counted {primary_language} lines; below 1,000-line failure floor, "
+            f"and logical_loc {logical_loc} is not a small whole repo."
+        )
+    return {
+        "status": status,
+        "reason": reason,
+        "counted_primary_language": primary_language,
+        "counted_primary_language_loc": primary_lines,
+        "target_min_primary_language_loc": TARGET_MIN_PRIMARY_LANGUAGE_LOC,
+        "under_fail_min_primary_language_loc": UNDER_FAIL_MIN_PRIMARY_LANGUAGE_LOC,
+        "small_repo_close_rule": {
+            "max_logical_loc": SMALL_REPO_MAX_LOGICAL_LOC,
+            "minimum_ratio": SMALL_REPO_CLOSE_RATIO,
+            "absolute_tolerance_loc": SMALL_REPO_ABS_TOLERANCE,
+        },
+    }
+
+
+SUPPORT_FILE_NAMES = {
+    "readme",
+    "readme.md",
+    "readme.rst",
+    "readme.txt",
+    "license",
+    "license.md",
+    "copying",
+    "package.json",
+    "pyproject.toml",
+    "composer.json",
+    "go.mod",
+    "cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "settings.gradle",
+    "requirements.txt",
+}
+
+
+def select_sample_files(stats: list[FileStat], primary_language: str) -> list[FileStat]:
+    primary = [
+        stat
+        for stat in stats
+        if not stat.dependency and not stat.generated and stat.language == primary_language and stat.code_loc > 0
+    ]
+    primary.sort(key=lambda stat: (-stat.code_loc, stat.rel))
+    selected: list[FileStat] = []
+    total = 0
+    for stat in primary:
+        selected.append(stat)
+        total += stat.code_loc
+        if total >= TARGET_MIN_PRIMARY_LANGUAGE_LOC:
+            break
+    if not selected:
+        fallback = [stat for stat in stats if not stat.dependency and not stat.generated and stat.code_loc > 0]
+        fallback.sort(key=lambda stat: (-stat.code_loc, stat.rel))
+        selected = fallback[:30]
+    selected_rels = {stat.rel for stat in selected}
+    for stat in stats:
+        if stat.rel in selected_rels or stat.dependency:
+            continue
+        if Path(stat.rel).parent == Path(".") and stat.path.name.lower() in SUPPORT_FILE_NAMES:
+            selected.append(stat)
+            selected_rels.add(stat.rel)
+    return selected
+
+
+def sample_zip_path(output: str | None, repo_id: str) -> Path:
+    if not output:
+        return Path.cwd() / f"{repo_id}_sample.zip"
+    path = Path(output)
+    if path.suffix.lower() == ".zip":
+        return path
+    return path / f"{repo_id}_sample.zip"
+
+
+def write_sample_zip(
+    repo: Path,
+    repo_id: str,
+    row: dict[str, Any],
+    stats: list[FileStat],
+    output: str | None,
+) -> dict[str, Any]:
+    primary_language = str(row.get("primary_language") or "")
+    selected = select_sample_files(stats, primary_language)
+    primary_lines = sum(stat.code_loc for stat in selected if stat.language == primary_language)
+    quality = sample_quality(primary_language, primary_lines, int(row.get("logical_loc") or 0))
+    quality.update(
+        {
+            "selected_files": len(selected),
+            "selected_total_nonblank_loc": sum(stat.code_loc for stat in selected),
+            "zip_shape": "data/{repo_id}/samples/...",
+        }
+    )
+    out = sample_zip_path(output, repo_id).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    base = f"data/{repo_id}"
+    manifest = {
+        "repo_id": repo_id,
+        "created_by": "reposcanner",
+        "anonymization_required_before_sharing": True,
+        "sample_quality": quality,
+        "files": [{"path": stat.rel, "language": stat.language, "code_loc": stat.code_loc} for stat in selected],
+    }
+    summary = (
+        "# Repository Summary\n\n"
+        f"Primary language: {primary_language or 'unknown'}\n\n"
+        f"Logical LOC: {row.get('logical_loc')}\n\n"
+        f"Sample QA: {quality['status']} - {quality['reason']}\n"
+    )
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for stat in selected:
+            zf.write(stat.path, f"{base}/samples/{stat.rel}")
+        zf.writestr(f"{base}/repo_summary.md", summary)
+        zf.writestr(f"{base}/metadata.json", json.dumps(row, indent=2, ensure_ascii=False))
+        zf.writestr(f"{base}/sample_quality.json", json.dumps(quality, indent=2, ensure_ascii=False))
+        zf.writestr(f"{base}/sample_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+    quality["zip_path"] = str(out)
+    quality["zip_bytes"] = out.stat().st_size
+    return quality
+
+
 def load_sale_model() -> dict[str, Any] | None:
     model_path = Path(__file__).with_name("sale_model.json")
     if not model_path.exists():
@@ -1026,6 +1288,8 @@ def build_metadata(
     *,
     include_token_stats: bool = False,
     include_sale_prediction: bool = True,
+    prep_sample: bool = False,
+    sample_output: str | None = None,
     description: str | None = None,
     hud: ScanHud | None = None,
 ) -> dict:
@@ -1126,6 +1390,14 @@ def build_metadata(
         prediction = predict_sale(row)
         if prediction:
             row["sale_prediction"] = prediction
+    if prep_sample:
+        if hud:
+            hud.log("Preparing anonymized-sample zip structure")
+            hud.task("sample", "Writing sample zip", 1)
+        quality = write_sample_zip(repo, repo_id, row, stats, sample_output)
+        row["sample_quality"] = quality
+        if hud:
+            hud.complete("sample")
     if hud:
         hud.complete("metrics")
         hud.summary(row, stats)
@@ -1202,6 +1474,8 @@ def scan_command(args: argparse.Namespace) -> int:
             args.sample_loc,
             include_token_stats=args.schema == "extended",
             include_sale_prediction=args.schema == "extended",
+            prep_sample=args.prep_sample,
+            sample_output=args.sample_output,
             description=description,
             hud=hud,
         )
@@ -1230,6 +1504,8 @@ def main() -> int:
     scan.add_argument("--description-file", default=None, help="Optional file containing repo description text.")
     scan.add_argument("--output", "-o", default="-", help="Output path, or '-' for stdout.")
     scan.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
+    scan.add_argument("--prep-sample", action="store_true", help="Create a customer-facing code sample zip. Anonymize the repository before using this.")
+    scan.add_argument("--sample-output", default=None, help="Sample zip path or output directory. Default: ./<repo_id>_sample.zip")
     hud_group = scan.add_mutually_exclusive_group()
     hud_group.add_argument("--hud", dest="hud", action="store_true", default=True, help="Show the rich progress HUD on stderr. Enabled by default.")
     hud_group.add_argument("--no-hud", dest="hud", action="store_false", help="Disable the rich progress HUD.")
