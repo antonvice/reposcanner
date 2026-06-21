@@ -21,11 +21,24 @@ import re
 import subprocess
 import sys
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
 
 
 METADATA_COLUMNS = [
@@ -266,6 +279,105 @@ class FileStat:
     dependency: bool
 
 
+class ScanHud(AbstractContextManager["ScanHud"]):
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.console = Console(stderr=True)
+        self.progress: Progress | None = None
+        self._tasks: dict[str, TaskID] = {}
+
+    def __enter__(self) -> "ScanHud":
+        if self.enabled:
+            self.console.print(
+                Panel.fit(
+                    "[bold cyan]reposcanner[/bold cyan]\n"
+                    "[dim]local repository metadata scan[/dim]",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                )
+            )
+            self.progress = Progress(
+                SpinnerColumn("dots"),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=None),
+                TextColumn("[bold]{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                console=self.console,
+                transient=False,
+            )
+            self.progress.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self.progress:
+            self.progress.stop()
+        if self.enabled and exc:
+            self.console.print(
+                Panel.fit(
+                    f"[bold red]scan failed[/bold red]\n{exc}",
+                    border_style="red",
+                    box=box.ROUNDED,
+                )
+            )
+
+    def log(self, message: str) -> None:
+        if self.enabled:
+            self.console.log(message)
+
+    def task(self, key: str, description: str, total: int) -> None:
+        if not self.progress:
+            return
+        total = max(total, 1)
+        self._tasks[key] = self.progress.add_task(description, total=total)
+
+    def advance(self, key: str, amount: int = 1) -> None:
+        if self.progress and key in self._tasks:
+            self.progress.advance(self._tasks[key], amount)
+
+    def complete(self, key: str) -> None:
+        if self.progress and key in self._tasks:
+            task_id = self._tasks[key]
+            task = self.progress.tasks[task_id]
+            self.progress.update(task_id, completed=task.total)
+
+    def summary(self, row: dict, stats: list[FileStat]) -> None:
+        if not self.enabled:
+            return
+        lang_loc: Counter[str] = Counter()
+        for stat in stats:
+            if not stat.dependency and stat.code_loc > 0:
+                lang_loc[stat.language] += stat.code_loc
+
+        overview = Table.grid(padding=(0, 2))
+        overview.add_column(style="bold cyan")
+        overview.add_column(justify="right")
+        overview.add_row("Primary language", str(row.get("primary_language") or ""))
+        overview.add_row("Logical LOC", f"{row.get('logical_loc', 0):,}")
+        overview.add_row("Raw LOC", f"{row.get('raw_loc', 0):,}")
+        overview.add_row("Source files", f"{row.get('source_files', 0):,}")
+        token_stats_row = row.get("token_stats")
+        token_display = (
+            f"{token_stats_row.get('estimated_code_tokens', 0):,}"
+            if isinstance(token_stats_row, dict)
+            else "not requested"
+        )
+        overview.add_row("Estimated code tokens", token_display)
+        self.console.print(Panel(overview, title="Scan Summary", border_style="green", box=box.ROUNDED))
+
+        if lang_loc:
+            total = sum(lang_loc.values())
+            table = Table(title="Language Lines", box=box.SIMPLE_HEAVY)
+            table.add_column("Language", style="bold")
+            table.add_column("LOC", justify="right")
+            table.add_column("Share", justify="right")
+            table.add_column("Distribution")
+            for language, loc in sorted(lang_loc.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:8]:
+                share = loc / total if total else 0
+                bar = "█" * max(1, round(share * 24))
+                table.add_row(language, f"{loc:,}", f"{share:.1%}", f"[cyan]{bar}[/cyan]")
+            self.console.print(table)
+
+
 def run(cmd: list[str], cwd: Path) -> str:
     try:
         return subprocess.check_output(
@@ -362,12 +474,20 @@ def count_code_and_comments(text: str, language: str) -> tuple[int, int]:
     return code, comments
 
 
-def collect_file_stats(repo: Path) -> list[FileStat]:
+def collect_file_stats(repo: Path, hud: ScanHud | None = None) -> list[FileStat]:
     stats: list[FileStat] = []
-    for path in iter_candidate_files(repo):
+    if hud:
+        hud.log(f"Discovering source-like files under [bold]{repo}[/bold]")
+    candidates = list(iter_candidate_files(repo))
+    if hud:
+        hud.task("files", "Counting files", len(candidates))
+        hud.log(f"Found [bold]{len(candidates):,}[/bold] candidate files")
+    for path in candidates:
         rel = path.relative_to(repo).as_posix()
         language = language_for(path)
         if not language:
+            if hud:
+                hud.advance("files")
             continue
         text = read_text(path)
         raw_loc = len(text.splitlines())
@@ -386,6 +506,8 @@ def collect_file_stats(repo: Path) -> list[FileStat]:
                 dependency=is_dependency_path(rel),
             )
         )
+        if hud:
+            hud.advance("files")
     return stats
 
 
@@ -754,14 +876,19 @@ def build_metadata(
     *,
     include_token_stats: bool = False,
     description: str | None = None,
+    hud: ScanHud | None = None,
 ) -> dict:
-    stats = collect_file_stats(repo)
+    stats = collect_file_stats(repo, hud)
     no_deps = [s for s in stats if not s.dependency]
+    if hud:
+        hud.task("metrics", "Computing metrics", 8)
     raw_loc = sum(s.raw_loc for s in stats)
     logical_loc = sum(s.code_loc for s in no_deps)
     autogen_loc = sum(s.code_loc for s in no_deps if s.generated)
     symbols_count = sum(s.symbols_count for s in no_deps)
     source_files = len(stats)
+    if hud:
+        hud.advance("metrics")
     lang_loc = Counter()
     ext_loc = Counter()
     comments = 0
@@ -772,11 +899,37 @@ def build_metadata(
         ext_loc[stat.extension] += stat.code_loc
         comments += stat.comment_loc
     primary_language = choose_primary_language(lang_loc)
+    if hud:
+        hud.log(f"Primary language: [bold green]{primary_language or 'unknown'}[/bold green]")
+        hud.advance("metrics")
     doc_ratio, avg_len = function_metrics(no_deps)
+    if hud:
+        hud.advance("metrics")
     git_mb = du_mb(repo / ".git")
     total_mb = du_mb(repo)
     bundle_mb = round(bundle_path.stat().st_size / 1024 / 1024, 3) if bundle_path and bundle_path.exists() else 0.0
     sample_loc = sample_loc_override if sample_loc_override is not None else logical_loc
+    if hud:
+        hud.advance("metrics")
+    commit_count = git_commit_count(repo)
+    contributors_count = git_contributors_count(repo)
+    total_pr_count = git_pr_count(repo)
+    created = created_at(repo)
+    branches = branch_count(repo)
+    if hud:
+        hud.advance("metrics")
+    ci = "Yes" if has_ci(repo) else "No"
+    deployment = deployment_infra(repo)
+    mon = monitoring(no_deps)
+    tests = test_suite(repo, stats)
+    containers = containerized(repo)
+    if hud:
+        hud.advance("metrics")
+    readme = readme_quality(repo)
+    issues = issue_tracker(repo)
+    docs = documentation_cnt(repo)
+    if hud:
+        hud.advance("metrics")
     row = {
         "repo_id": repo_id,
         "raw_loc": raw_loc,
@@ -786,26 +939,26 @@ def build_metadata(
         "source_files": source_files,
         "primary_language": primary_language,
         "lang_distribution": rounded_distribution(lang_loc, logical_loc),
-        "commit_count": git_commit_count(repo),
-        "contributors_count": git_contributors_count(repo),
-        "total_pr_count": git_pr_count(repo),
+        "commit_count": commit_count,
+        "contributors_count": contributors_count,
+        "total_pr_count": total_pr_count,
         "reviewed_pr_count": 0,
-        "ci_checks": "Yes" if has_ci(repo) else "No",
-        "deployment_infra": deployment_infra(repo),
-        "monitoring": monitoring(no_deps),
-        "test_suite": test_suite(repo, stats),
-        "containerized": containerized(repo),
+        "ci_checks": ci,
+        "deployment_infra": deployment,
+        "monitoring": mon,
+        "test_suite": tests,
+        "containerized": containers,
         "docstring_ratio": doc_ratio,
-        "readme_quality": readme_quality(repo),
-        "issue_tracker": issue_tracker(repo),
+        "readme_quality": readme,
+        "issue_tracker": issues,
         "avg_func_length": avg_len,
-        "created_at": created_at(repo),
-        "branch_count": branch_count(repo),
+        "created_at": created,
+        "branch_count": branches,
         "repo_bundle_mb": bundle_mb,
         "repo_git_history_mb": git_mb,
         "repo_worktree_mb": round(max(total_mb - git_mb, 0.0), 3),
         "extensions": rounded_distribution(ext_loc, logical_loc),
-        "documentation_cnt": documentation_cnt(repo),
+        "documentation_cnt": docs,
         "comment_ratio": round(comments / logical_loc, 6) if logical_loc else 0.0,
         "sample_loc": sample_loc,
     }
@@ -813,7 +966,12 @@ def build_metadata(
     if description:
         row["repo_description"] = description
     if include_token_stats:
+        if hud:
+            hud.log("Estimating code tokens")
         row["token_stats"] = token_stats(no_deps)
+    if hud:
+        hud.complete("metrics")
+        hud.summary(row, stats)
     return row
 
 
@@ -879,14 +1037,16 @@ def scan_command(args: argparse.Namespace) -> int:
         description = args.description
     elif args.description_file:
         description = Path(args.description_file).read_text(encoding="utf-8").strip()
-    row = build_metadata(
-        repo,
-        repo_id,
-        bundle_path,
-        args.sample_loc,
-        include_token_stats=args.schema == "extended",
-        description=description,
-    )
+    with ScanHud(args.hud) as hud:
+        row = build_metadata(
+            repo,
+            repo_id,
+            bundle_path,
+            args.sample_loc,
+            include_token_stats=args.schema == "extended",
+            description=description,
+            hud=hud,
+        )
     if args.schema == "core":
         row = {column: row.get(column) for column in METADATA_COLUMNS}
     text = format_row(row, args.format, args.pretty)
@@ -912,6 +1072,9 @@ def main() -> int:
     scan.add_argument("--description-file", default=None, help="Optional file containing repo description text.")
     scan.add_argument("--output", "-o", default="-", help="Output path, or '-' for stdout.")
     scan.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
+    hud_group = scan.add_mutually_exclusive_group()
+    hud_group.add_argument("--hud", dest="hud", action="store_true", default=True, help="Show the rich progress HUD on stderr. Enabled by default.")
+    hud_group.add_argument("--no-hud", dest="hud", action="store_false", help="Disable the rich progress HUD.")
 
     subparsers.add_parser("description-prompt", help="Print the Codex prompt for writing repo descriptions.")
     args = parser.parse_args()

@@ -2,7 +2,7 @@
 
 `reposcanner` is a small CLI for generating one repository metadata row for code dataset QA.
 
-It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. It has no runtime dependencies beyond Python.
+It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. The CLI uses `rich` for progress, logs, and summary tables.
 
 ## Install
 
@@ -37,6 +37,8 @@ Run inside the repository you want to scan:
 reposcanner scan --repo . --pretty --output repo_metadata.json
 ```
 
+By default, `reposcanner` shows a live terminal HUD with progress bars, scan logs, a summary panel, and a language distribution table. The HUD writes to stderr, so stdout remains safe for JSON/JSONL piping.
+
 Core metadata columns only:
 
 ```bash
@@ -65,6 +67,12 @@ Print to stdout:
 
 ```bash
 reposcanner scan --repo . --format jsonl
+```
+
+Disable the HUD for scripts or CI:
+
+```bash
+reposcanner scan --repo . --no-hud --format jsonl
 ```
 
 ## Output Schemas
