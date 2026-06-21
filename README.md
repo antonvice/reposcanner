@@ -318,13 +318,23 @@ Description:
 
 ## Repository Description Prompt
 
-To create a clean customer-facing repo description with Codex:
+The repository description is part of evaluation metadata. It helps reviewers quickly understand what the codebase does, what domain it serves, and which technical components matter. A missing or vague description makes the repository harder to evaluate.
+
+To create a clean customer-facing repo description locally with Codex:
 
 ```bash
 reposcanner description-prompt
 ```
 
 Paste that prompt into Codex while Codex is opened inside the target repository. It asks Codex to inspect README files, manifests, entrypoints, and top-level directories, then produce a short paragraph without mentioning internal delivery process.
+
+You can also use a local model through tools such as Ollama, LM Studio, llama.cpp, or any other local inference setup. That keeps repository contents on your machine. Save the generated paragraph to a file, review/anonymize it, then include it in the scan:
+
+```bash
+reposcanner . --description-file repo_description.txt
+```
+
+The description is stored as `repo_description` in `metadata.json` and is also anonymized by the default output sanitizer.
 
 ## Development
 

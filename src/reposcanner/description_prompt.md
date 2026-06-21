@@ -2,6 +2,8 @@
 
 You are inside a software repository. Inspect the repository and write a concise customer-facing description of what this repository is.
 
+This description will be included in repository sale-evaluation metadata, so it must be accurate, specific, and safe to share after anonymization.
+
 Requirements:
 - Output only one paragraph, 2-4 sentences.
 - Describe the product/domain, main user-facing purpose, and the most important technical components.
