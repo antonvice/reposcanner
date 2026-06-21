@@ -13,9 +13,32 @@ dependencies = [
 license = "MIT"
 keywords = ["repository", "metadata", "loc", "code-analysis", "dataset"]
 
+[dependency-groups]
+dev = [
+    "pre-commit>=3.7.0",
+    "pytest>=8.2.0",
+    "ruff>=0.8.0",
+]
+
+[project.optional-dependencies]
+ai = [
+    "accelerate>=0.30.0",
+    "huggingface-hub>=0.24.0",
+    "safetensors>=0.4.3",
+    "torch>=2.2.0",
+    "transformers>=4.44.0",
+]
+
 [project.scripts]
 reposcanner = "reposcanner.scanner:main"
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

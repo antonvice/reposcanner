@@ -1,91 +1,130 @@
+<p align="center">
+  <img src="assets/reposcanner-logo.svg" alt="reposcanner" width="760">
+</p>
+
+<p align="center">
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB">
+  <img alt="Local only" src="https://img.shields.io/badge/code%20privacy-local%20only-10B981">
+  <img alt="AI gate" src="https://img.shields.io/badge/AI%20code%20gate-10%25%20threshold-8B5CF6">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-pytest-0F172A">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
+
 # reposcanner
 
-`reposcanner` is a small CLI for generating one repository metadata row for code dataset QA and repository sale preparation.
+`reposcanner` prepares private/internal repositories for code dataset sale review. It generates local metadata, sale-readiness scores, AI-generated-code estimates, anonymized sample zips, token/LOC stats, and privacy reports.
 
-It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. The CLI uses `rich` for progress, logs, summary tables, and a sale-fit HUD.
+AI code is everywhere now. That part is inevitable. The useful question is whether the people who wrote strong code can still get paid for that skill, and whether future coding models learn from good engineering taste instead of random sludge. A private repository owner can become a paid teacher for the next generation of code models: anonymize the work, keep secrets out, provide a safe sample, and let the market value the craft.
 
-If the analysis reports Tier 1 / high probability of sale, email `hello@grably.us` at GRABLY Inc. with a short note that you would like to sell the repository and work out a deal. Attach the prepared sample zip to that message; without the sample, GRABLY cannot evaluate it. The repository and sample must be anonymized before creating or sending the sample.
+This is not a Roko's Basilisk thing. That thought experiment is about coercion by a hypothetical future AI. `reposcanner` is the opposite: voluntary, local, auditable, and designed to keep sensitive company information out of what you share.
 
-## Install
+## Sale Requirements
 
-From GitHub:
+For a repository to be a strong sale candidate:
+
+- It should be Tier 1 from the local sale-fit model.
+- It should have low AI-generated code, currently `<= 10%`, unless you include an explanation and appeal.
+- It should contain high-quality, human-written, production-grade code.
+- It must be private or internal. Public/open-source repositories are not accepted for this sale path.
+- The prepared sample must be anonymized before sending.
+
+If the report says Tier 1 / high probability of sale, email `hello@grably.us` at GRABLY Inc. with a short note that you would like to sell the repository and work out a deal. Attach the anonymized sample zip. Without the sample, GRABLY cannot evaluate it.
+
+## No Source-Code APIs
+
+`reposcanner` does not send repository source code to external APIs. Scanning, LOC counting, anonymization, sample creation, sale scoring, and AI-generated-code detection run locally.
+
+The DroidDetect model backend may download model weights into your local Hugging Face cache on first run. That download fetches model files; it does not upload your source code. If you need zero network activity, pre-cache the model or run `--ai-detector-backend heuristic` / `--no-ai-detect`.
+
+## One-Line Use
+
+From inside the repository you want to scan:
 
 ```bash
-uv tool install git+https://github.com/antonvice/reposcanner.git
+uvx --from "reposcanner[ai] @ git+https://github.com/antonvice/reposcanner.git" reposcanner .
 ```
 
-From a local checkout:
+That runs the default full pipeline and writes:
+
+```text
+reposcanner_out/
+  metadata.json
+  {repo_id}_sample.zip
+```
+
+You can also pass a path:
+
+```bash
+uvx --from "reposcanner[ai] @ git+https://github.com/antonvice/reposcanner.git" reposcanner /path/to/private-repo
+```
+
+Fast local checkout usage:
 
 ```bash
 git clone https://github.com/antonvice/reposcanner.git
 cd reposcanner
-uv tool install .
+uv sync --all-extras --group dev
+uv run reposcanner . --ai-max-files 1
 ```
 
-For development:
+## Default Pipeline
+
+By default, `reposcanner .` runs:
+
+- metadata scan
+- fair LOC/language counting
+- token estimates
+- local sale-fit tier/probability model
+- local AI-generated-code detection
+- default anonymization
+- customer-facing sample zip creation
+- metadata and sample output into `reposcanner_out/`
+
+The repository itself is not modified. Anonymization is applied to generated outputs, especially the sample zip.
+
+## Key Commands
+
+Print metadata to stdout:
 
 ```bash
-git clone https://github.com/antonvice/reposcanner.git
-cd reposcanner
-uv sync
-uv run reposcanner --help
+reposcanner . --output - --no-prep-sample
 ```
 
-## Quick Start
-
-Run inside the repository you want to scan:
+Write to a custom output folder:
 
 ```bash
-reposcanner scan --repo . --pretty --output repo_metadata.json
+reposcanner . --output-dir ./sale_scan
 ```
 
-By default, `reposcanner` shows a live terminal HUD with progress bars, scan logs, a summary panel, and a language distribution table. The HUD writes to stderr, so stdout remains safe for JSON/JSONL piping.
-
-Core metadata columns only:
+Create only core source metadata columns:
 
 ```bash
-reposcanner scan --repo . --schema core --format json --pretty --output repo_metadata.json
+reposcanner . --schema core --output - --no-prep-sample
 ```
 
-JSONL:
+Skip heavy AI model inference:
 
 ```bash
-reposcanner scan --repo . --schema core --format jsonl --output repo_metadata.jsonl
+reposcanner . --no-ai-detect
 ```
 
-YAML:
+Use the slower/larger DroidDetect model:
 
 ```bash
-reposcanner scan --repo . --format yaml --output repo_metadata.yaml
+reposcanner . --ai-model project-droid/DroidDetect-Large-Binary
 ```
 
-Set a stable repository id:
+Refresh git refs before scanning metadata:
 
 ```bash
-reposcanner scan --repo . --repo-id 61860335-aa82-4a5b-93b9-ac0a8bb35a9f --pretty
+reposcanner . --refresh-git
 ```
 
-Print to stdout:
-
-```bash
-reposcanner scan --repo . --format jsonl
-```
-
-Disable the HUD for scripts or CI:
-
-```bash
-reposcanner scan --repo . --no-hud --format jsonl
-```
-
-Prepare a code sample zip after anonymizing the repository:
-
-```bash
-reposcanner scan --repo . --prep-sample --sample-output ./out --pretty --output repo_metadata.json
-```
+`--refresh-git` uses `git fetch --all --tags --prune`. It does not run `git pull` because pull mutates local branches. LOC is counted from the current checked-out worktree only, so fetched branches and older commits are not double-counted as code lines. Git history is used for metadata like commit/contributor/branch counts.
 
 ## Output Schemas
 
-Default schema is `extended`. It emits the base metadata columns plus useful local extras:
+Default schema is `extended`. It emits the 30 base metadata columns plus local extras:
 
 - `token_stats.estimated_code_tokens`
 - `token_stats.estimated_text_tokens`
@@ -94,10 +133,13 @@ Default schema is `extended`. It emits the base metadata columns plus useful loc
 - `sale_prediction.tier`
 - `sale_prediction.sale_probability`
 - `sale_prediction.similarity_to_sold`
+- `ai_generated_code_percent`
+- `ai_generated_code_sale_gate`
+- `ai_code_detection`
+- `sample_quality`
+- `anonymization`
 
-The bundled sale-fit model is trained on repositories that were previously sold. It runs locally with the package; there is no separate service call. Repositories with `similarity_to_sold >= 0.85` are reported as Tier 1 / high probability of sale, `>= 0.70` as Tier 2 / promising, and the rest as Tier 3 / standard.
-
-Use `--schema core` when you want only the source metadata columns:
+Use `--schema core` when you need only the base source metadata columns:
 
 ```text
 repo_id
@@ -136,19 +178,79 @@ sample_loc
 
 `reposcanner` counts language lines across the repository while excluding dependency/build directories for logical metrics.
 
-For `primary_language`, it intentionally skips non-primary data/markup/style languages when a real programming language exists. For example, if YAML, JSON, or CSS is the largest bucket but Python or JavaScript is also present, the scanner picks the real programming language instead of reporting YAML/JSON/CSS as primary.
+For `primary_language`, it skips non-primary data/markup/style languages when a real programming language exists. If YAML, JSON, or CSS is the largest bucket but Python, JavaScript, Java, Kotlin, C#, Go, Rust, PHP, or another programming language is present, the scanner picks the real programming language.
 
-The language distribution still includes counted languages that pass the 1% threshold, including JSON/YAML/CSS. Only the primary-language choice is adjusted.
+The language distribution still includes counted languages that pass the 1% threshold. Only the primary-language choice is adjusted.
 
 ## Fair LOC Counting
 
-Dependency, virtual environment, package cache, and build output directories are skipped during traversal. This includes common folders such as `.venv`, `.vwnv`, `venv`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.nuxt`, `.gradle`, `.m2`, `Pods`, `DerivedData`, `target`, `bin`, and `obj`.
+Dependency, virtual environment, package cache, and build output directories are skipped during traversal. This includes `.venv`, `.vwnv`, `venv`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.nuxt`, `.gradle`, `.m2`, `Pods`, `DerivedData`, `target`, `bin`, and `obj`.
 
-Those files do not contribute to raw LOC, logical LOC, source file count, language distribution, token estimates, or sale-fit scoring.
+Those files do not contribute to raw LOC, logical LOC, source file count, language distribution, token estimates, AI-code detection, or sale-fit scoring.
+
+## AI-Generated Code Detection
+
+The default AI detector is local [DroidDetect](https://huggingface.co/project-droid/DroidDetect-Base-Binary) (`project-droid/DroidDetect-Base-Binary`), reconstructed from the published model card architecture and checkpoint. For long files, `reposcanner` scores head/middle/tail chunks and uses the strongest generated-code signal for that file. A local heuristic guardrail is recorded and can raise the final score when the model under-detects generated utility code.
+
+The report includes:
+
+- `ai_generated_code_percent`
+- `ai_generated_code_ratio`
+- `ai_generated_code_sale_gate`
+- `ai_generated_code_requires_appeal`
+- `ai_code_detection.files[].droid_ai_probability`
+- `ai_code_detection.files[].heuristic_guardrail_probability`
+- `ai_code_detection.files[].droid_chunk_ai_probabilities`
+
+The sale gate is strict:
+
+- `<= 10%`: passes the AI-code gate.
+- `> 10%`: marked `BLOCKED_AI_GENERATED_CODE_APPEAL_REQUIRED`.
+
+AI-code detection is probabilistic. Treat it as a gate and review signal, not an absolute proof about every line.
+
+## Default Anonymization
+
+Anonymization is enabled by default for generated outputs. It does not rewrite your repository.
+
+The sanitizer replaces:
+
+- emails with `[EMAIL_001]`
+- phone numbers with `[PHONE_001]`
+- usernames and local user paths with `[USER_001]`
+- names and author/owner fields with `[NAME_001]`
+- company/org/customer/client terms with `[ORG_001]`
+- URLs, hosts, endpoints, and IP addresses with `[URL_001]` / `[IP_001]`
+- known tokens, private keys, JWTs, API keys, passwords, and high-entropy secrets with `[SECRET]`
+
+It automatically loads identity terms from git remotes, recent git author names/emails, repository folder name, `package.json`, and `pyproject.toml`. You should still add company/project/customer terms explicitly:
+
+```bash
+reposcanner . --anonymize-term "Acme Corp" --anonymize-term "Internal Platform"
+```
+
+Or from a file:
+
+```bash
+reposcanner . --anonymize-terms-file private_terms.txt
+```
+
+The sample zip includes `anonymization_report.json` with replacement counts. Review the sample before sending it. Automated anonymization is a strong first pass, not a substitute for human review of highly sensitive repos.
+
+## Secret-Removal Approach
+
+The local sanitizer combines pattern matching, contextual key matching, and entropy checks. This follows the same broad families of techniques used by common local secret scanners:
+
+- [GitHub secret scanning](https://docs.github.com/code-security/secret-scanning/about-secret-scanning) documents provider-specific and generic token patterns, including history-aware scanning across branches.
+- [Gitleaks](https://github.com/gitleaks/gitleaks) focuses on detecting secrets in repos/files/stdin with regex rules and entropy-style matching.
+- [Yelp detect-secrets](https://github.com/Yelp/detect-secrets) is plugin-based and supports regex-style detectors.
+- [Microsoft Presidio](https://microsoft.github.io/presidio/) separates PII detection from anonymization operators such as replace/redact/mask.
+
+`reposcanner` is intentionally conservative for sale samples: if something looks like a credential or private endpoint, it is safer to tag it than preserve it.
 
 ## Preparing A Sample
 
-`--prep-sample` creates a customer-facing sample zip shaped like:
+Default sample zip shape:
 
 ```text
 data/{repo_id}/
@@ -156,24 +258,61 @@ data/{repo_id}/
   metadata.json
   sample_quality.json
   sample_manifest.json
+  anonymization_report.json
   samples/
     ...
 ```
 
-Important: anonymize the repository before running `--prep-sample`. Remove company names, customer names, secrets, proprietary hostnames, private URLs, credentials, personal data, and any other identifying information first. The generated sample is intended to be attached to the email to GRABLY only after that anonymization step.
-
-The sample QA mirrors the repository sale pipeline:
+Sample QA mirrors the sale pipeline:
 
 - `PASS`: at least 5,000 counted lines in the primary programming language.
 - `PASS_UNDER_5K_ABOVE_1K`: 1,000-4,999 counted primary-language lines.
-- `PASS_SMALL_WHOLE_PROJECT`: small repositories where the sample is close to the whole repo (`logical_loc <= 6,500` and either at least 80% of logical LOC or within 500 LOC).
-- Fail statuses explain whether the primary language was missing, absent from the sample, too small, or not close enough to the whole repo.
+- `PASS_SMALL_WHOLE_PROJECT`: small repositories where the sample is close to the whole repo.
+- Fail statuses explain whether the primary language was missing, absent from the sample, too small, or not close enough.
 
-## Token Estimates
+## Flag Reference
 
-The extended schema includes a lightweight code-token estimate. It is not a model-specific tokenizer. It is a deterministic local heuristic that counts identifiers, literals, operators, and punctuation, which is useful for comparing repositories without installing tokenizer packages.
+Output and shape:
 
-For rough LLM text tokens, it also reports a standard `chars / 4` estimate.
+- `path`: positional repo path, same as `--repo`.
+- `--repo PATH`: repository root. Default `.`.
+- `--output PATH`: metadata output path. Use `--output -` for stdout.
+- `--output-dir DIR`: default output folder. Default `reposcanner_out`.
+- `--format json|jsonl|yaml`: metadata format. Default `json`.
+- `--pretty`: pretty-print JSON.
+- `--repo-id ID`: stable repository id. Default UUID4.
+- `--schema extended|core`: full metadata or the 30 base columns.
+- `--bundle-path PATH`: optional bundle/zip path for `repo_bundle_mb`.
+- `--sample-loc N`: override `sample_loc`.
+
+Pipeline toggles:
+
+- `--no-prep-sample`: skip sample zip creation.
+- `--no-token-stats`: skip token estimates.
+- `--no-sale-prediction`: skip local sale-fit scoring.
+- `--no-ai-detect`: skip AI-generated-code detection.
+- `--no-anonymize`: write generated outputs without anonymization.
+- `--refresh-git`: fetch all git refs/tags before scan.
+
+AI detector controls:
+
+- `--ai-detector-backend droid|heuristic`: default `droid`.
+- `--ai-model MODEL`: default `project-droid/DroidDetect-Base-Binary`.
+- `--ai-max-files N`: largest real source files to score. Default `8`.
+- `--ai-max-chars N`: characters sampled per file. Default `12000`.
+- `--ai-threshold RATIO`: sale gate threshold. Default `0.10`.
+- `--no-ai-fallback-heuristic`: fail detector status instead of falling back if DroidDetect cannot load.
+
+Anonymization controls:
+
+- `--anonymize-term TERM`: extra term to replace. Repeatable.
+- `--anonymize-terms-file PATH`: one term per line. Repeatable.
+
+Description:
+
+- `--description TEXT`: include a repo description in extended metadata.
+- `--description-file PATH`: read repo description from a file.
+- `reposcanner description-prompt`: print a Codex prompt for generating the description locally.
 
 ## Repository Description Prompt
 
@@ -183,17 +322,45 @@ To create a clean customer-facing repo description with Codex:
 reposcanner description-prompt
 ```
 
-Paste that prompt into Codex while Codex is opened inside the target repository. The prompt asks Codex to inspect README files, manifests, entrypoints, and top-level directories, then produce a short paragraph without mentioning suppliers or internal delivery process.
+Paste that prompt into Codex while Codex is opened inside the target repository. It asks Codex to inspect README files, manifests, entrypoints, and top-level directories, then produce a short paragraph without mentioning internal delivery process.
 
-You can include a generated description in extended metadata:
+## Development
+
+Install with all extras and dev tools:
 
 ```bash
-reposcanner scan --repo . --description-file repo_description.txt --pretty
+uv sync --all-extras --group dev
+```
+
+Run tests:
+
+```bash
+uv run pytest
+```
+
+Install local pre-commit hooks:
+
+```bash
+uv run pre-commit install
+```
+
+Run the same checks manually:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest
+```
+
+Reproducible demo scan on this repo:
+
+```bash
+uv run reposcanner . --ai-max-files 1 --output-dir reposcanner_out_demo --no-hud
 ```
 
 ## Notes
 
-- `sample_loc` defaults to `logical_loc`. If you are scanning a sampled subset and already know the sample LOC, pass `--sample-loc`.
-- `repo_bundle_mb` is `0.0` unless you pass `--bundle-path`.
+- `sample_loc` defaults to `logical_loc`.
+- `repo_bundle_mb` is `0.0` unless `--bundle-path` is provided.
 - `reviewed_pr_count` is `0` because local git history cannot reliably determine review status.
-- The scanner is conservative and local-only; it does not call external APIs.
+- The scanner is local-first and privacy-first; review anonymized samples before sending them anywhere.

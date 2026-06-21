@@ -23,8 +23,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
-from collections import Counter
-from collections import deque
+from collections import Counter, deque
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,8 +31,7 @@ from typing import Any, Iterable
 
 from rich import box
 from rich.align import Align
-from rich.console import Console
-from rich.console import Group
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -48,7 +46,6 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.text import Text
-
 
 METADATA_COLUMNS = [
     "repo_id",
@@ -88,6 +85,10 @@ UNDER_FAIL_MIN_PRIMARY_LANGUAGE_LOC = 1000
 SMALL_REPO_CLOSE_RATIO = 0.80
 SMALL_REPO_MAX_LOGICAL_LOC = 6500
 SMALL_REPO_ABS_TOLERANCE = 500
+AI_GENERATED_REJECTION_THRESHOLD = 0.10
+DEFAULT_AI_DETECTOR_MODEL = "project-droid/DroidDetect-Base-Binary"
+LARGE_AI_DETECTOR_MODEL = "project-droid/DroidDetect-Large-Binary"
+DEFAULT_OUTPUT_DIR = "reposcanner_out"
 
 
 DEPENDENCY_DIRS = {
@@ -402,7 +403,7 @@ class ScanHud(AbstractContextManager["ScanHud"]):
 
     def header(self) -> Panel:
         title = Text("Repository Sale Prep Console", style="bold bright_cyan")
-        subtitle = Text("fair LOC • primary language QA • token stats • sale-fit model", style="dim")
+        subtitle = Text("fair LOC • primary language QA • token stats • sale-fit model • AI-code gate", style="dim")
         pulse = Text("◆ " * 18, style="magenta")
         return Panel(Align.center(Group(title, subtitle, pulse)), border_style="cyan", box=box.ROUNDED)
 
@@ -423,6 +424,13 @@ class ScanHud(AbstractContextManager["ScanHud"]):
             label = sale_prediction.get("label")
             table.add_row("Sale prob", f"[bold]{probability:.1%}[/bold]")
             table.add_row("Tier", f"[bold magenta]{tier}[/bold magenta] [dim]{label}[/dim]")
+        ai_detection = row.get("ai_code_detection")
+        if isinstance(ai_detection, dict):
+            percent = float(ai_detection.get("ai_generated_code_percent") or 0)
+            gate = ai_detection.get("sale_gate_status") or "unknown"
+            gate_style = "red" if "BLOCKED" in str(gate) else "green"
+            table.add_row("AI code", f"[bold]{percent:.1f}%[/bold]")
+            table.add_row("AI gate", f"[{gate_style}]{gate}[/{gate_style}]")
         sample = row.get("sample_quality")
         if isinstance(sample, dict):
             style = "green" if str(sample.get("status", "")).startswith("PASS") else "red"
@@ -549,10 +557,7 @@ def iter_candidate_files(repo: Path) -> Iterable[Path]:
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in ALWAYS_SKIP_DIRS
-            and d not in DEPENDENCY_DIRS
-            and not d.endswith(".egg-info")
-            and not d.startswith(".cache")
+            if d not in ALWAYS_SKIP_DIRS and d not in DEPENDENCY_DIRS and not d.endswith(".egg-info") and not d.startswith(".cache")
         ]
         for name in filenames:
             path = Path(dirpath) / name
@@ -649,11 +654,7 @@ def collect_file_stats(repo: Path, hud: ScanHud | None = None) -> list[FileStat]
 def rounded_distribution(counter: Counter[str], total: int) -> dict[str, float]:
     if total <= 0:
         return {}
-    out = {
-        key: round(value / total, 6)
-        for key, value in counter.items()
-        if value > 0 and value / total >= 0.01
-    }
+    out = {key: round(value / total, 6) for key, value in counter.items() if value > 0 and value / total >= 0.01}
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0].lower())))
 
 
@@ -726,6 +727,15 @@ def created_at(repo: Path) -> str:
 def branch_count(repo: Path) -> int:
     output = run(["git", "branch", "-a"], repo)
     return sum(1 for line in output.splitlines() if line.strip())
+
+
+def refresh_git_refs(repo: Path, hud: ScanHud | None = None) -> str:
+    if not (repo / ".git").exists():
+        return "skipped: not a git repository"
+    if hud:
+        hud.log("Refreshing git refs with fetch --all --tags --prune")
+    output = run(["git", "fetch", "--all", "--tags", "--prune"], repo)
+    return output or "ok"
 
 
 def du_mb(path: Path) -> float:
@@ -1020,13 +1030,652 @@ def token_stats(stats: list[FileStat]) -> dict[str, Any]:
     }
 
 
+def clamp01(value: float) -> float:
+    return min(max(value, 0.0), 1.0)
+
+
+def detector_chunks(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunk = max(max_chars // 3, 1)
+    middle_start = max((len(text) // 2) - (chunk // 2), 0)
+    return [text[:chunk], text[middle_start : middle_start + chunk], text[-chunk:]]
+
+
+def detector_snippet(text: str, max_chars: int) -> str:
+    return "\n\n".join(detector_chunks(text, max_chars))
+
+
+def select_ai_detection_files(stats: list[FileStat], max_files: int) -> list[FileStat]:
+    eligible = [
+        stat
+        for stat in stats
+        if not stat.dependency and not stat.generated and stat.code_loc > 0 and stat.language not in NON_PRIMARY_LANGUAGES
+    ]
+    if not eligible:
+        eligible = [stat for stat in stats if not stat.dependency and not stat.generated and stat.code_loc > 0]
+    eligible.sort(key=lambda stat: (-stat.code_loc, stat.rel))
+    return eligible[: max(max_files, 0)]
+
+
+def ai_generated_label_indexes(labels: dict[int, str], class_count: int) -> set[int]:
+    generated_indexes: set[int] = set()
+    for index, label in labels.items():
+        lowered = label.lower()
+        if "human" in lowered:
+            continue
+        if "machine" in lowered or "ai" in lowered:
+            generated_indexes.add(index)
+    if not generated_indexes and class_count == 2:
+        generated_indexes.add(1)
+    return generated_indexes
+
+
+def droid_label_map(class_count: int) -> dict[int, str]:
+    if class_count == 2:
+        return {0: "HUMAN_GENERATED", 1: "MACHINE_GENERATED"}
+    if class_count == 3:
+        return {0: "HUMAN_GENERATED", 1: "MACHINE_GENERATED", 2: "MACHINE_REFINED"}
+    if class_count == 4:
+        return {
+            0: "HUMAN_GENERATED",
+            1: "MACHINE_GENERATED",
+            2: "MACHINE_REFINED",
+            3: "MACHINE_GENERATED_ADVERSARIAL",
+        }
+    return {index: f"LABEL_{index}" for index in range(class_count)}
+
+
+def droid_base_model_name(model_name: str) -> str:
+    return "answerdotai/ModernBERT-large" if "large" in model_name.lower() else "answerdotai/ModernBERT-base"
+
+
+def load_droid_model(model_name: str) -> tuple[Any, Any, dict[int, str]]:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("install AI dependencies with `uv tool install 'reposcanner[ai]'` or `uv sync --extra ai`") from exc
+
+    class DroidDetectModel(nn.Module):
+        def __init__(self, text_encoder: Any, hidden_dim: int, projection_dim: int, num_classes: int) -> None:
+            super().__init__()
+            self.text_encoder = text_encoder
+            self.text_projection = nn.Linear(hidden_dim, projection_dim)
+            self.classifier = nn.Linear(projection_dim, num_classes)
+
+        def forward(self, input_ids: Any = None, attention_mask: Any = None, **_: Any) -> dict[str, Any]:
+            sentence_embeddings = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            sentence_embeddings = sentence_embeddings.mean(dim=1)
+            projected_text = F.relu(self.text_projection(sentence_embeddings))
+            return {"logits": self.classifier(projected_text)}
+
+    tokenizer = AutoTokenizer.from_pretrained(droid_base_model_name(model_name))
+    checkpoint_path = hf_hub_download(model_name, "pytorch_model.bin")
+    state = torch.load(checkpoint_path, map_location="cpu")
+    projection_weight = state.get("text_projection.weight")
+    classifier_weight = state.get("classifier.weight")
+    if projection_weight is None or classifier_weight is None:
+        raise RuntimeError("DroidDetect checkpoint is missing text_projection/classifier weights")
+    projection_dim, hidden_dim = projection_weight.shape
+    num_classes = classifier_weight.shape[0]
+    base_config = AutoConfig.from_pretrained(droid_base_model_name(model_name))
+    text_encoder = AutoModel.from_config(base_config)
+    model = DroidDetectModel(text_encoder, int(hidden_dim), int(projection_dim), int(num_classes))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    meaningful_missing = [key for key in missing if not key.startswith("additional_loss.")]
+    meaningful_unexpected = [key for key in unexpected if not key.startswith("additional_loss.")]
+    if meaningful_missing or meaningful_unexpected:
+        raise RuntimeError(
+            "DroidDetect checkpoint did not match reconstructed model "
+            f"(missing={meaningful_missing[:5]}, unexpected={meaningful_unexpected[:5]})"
+        )
+    return tokenizer, model, droid_label_map(int(num_classes))
+
+
+def summarize_ai_detection(
+    records: list[dict[str, Any]],
+    *,
+    backend: str,
+    model_name: str | None,
+    threshold: float,
+    notes: list[str],
+    status: str = "completed",
+    detector_error: str | None = None,
+) -> dict[str, Any]:
+    scanned_loc = sum(int(record.get("code_loc") or 0) for record in records)
+    weighted_ai_loc = sum(float(record.get("ai_probability") or 0) * int(record.get("code_loc") or 0) for record in records)
+    ratio = weighted_ai_loc / scanned_loc if scanned_loc else 0.0
+    likely_ai_loc = sum(int(record.get("code_loc") or 0) for record in records if float(record.get("ai_probability") or 0) >= 0.50)
+    gate_status = (
+        "BLOCKED_AI_GENERATED_CODE_APPEAL_REQUIRED"
+        if status == "completed" and ratio > threshold
+        else "PASS_AI_GENERATED_CODE_GATE"
+        if status == "completed"
+        else "UNKNOWN_AI_DETECTOR_UNAVAILABLE"
+    )
+    if gate_status == "BLOCKED_AI_GENERATED_CODE_APPEAL_REQUIRED":
+        gate_reason = (
+            f"Estimated AI-generated code is {ratio * 100:.2f}%, above the "
+            f"{threshold * 100:.1f}% sale threshold. Explain and appeal before submitting."
+        )
+    elif gate_status == "PASS_AI_GENERATED_CODE_GATE":
+        gate_reason = f"Estimated AI-generated code is {ratio * 100:.2f}%, within the {threshold * 100:.1f}% threshold."
+    else:
+        gate_reason = "AI detector could not complete; rerun with the optional AI dependencies before sale submission."
+    label_counts = Counter(str(record.get("predicted_label") or "unknown") for record in records)
+    result = {
+        "enabled": True,
+        "status": status,
+        "backend": backend,
+        "model": model_name or "",
+        "ai_generated_code_ratio": round(ratio, 6),
+        "ai_generated_code_percent": round(ratio * 100, 4),
+        "expected_ai_generated_loc": round(weighted_ai_loc, 2),
+        "likely_ai_generated_loc": likely_ai_loc,
+        "scanned_loc": scanned_loc,
+        "scanned_files": len(records),
+        "sale_rejection_threshold_ratio": threshold,
+        "sale_rejection_threshold_percent": round(threshold * 100, 4),
+        "sale_gate_status": gate_status,
+        "sale_gate_reason": gate_reason,
+        "requires_explanation_or_appeal": gate_status == "BLOCKED_AI_GENERATED_CODE_APPEAL_REQUIRED",
+        "label_counts": dict(sorted(label_counts.items())),
+        "files": records,
+        "notes": notes,
+    }
+    if detector_error:
+        result["detector_error"] = detector_error[:500]
+    return result
+
+
+def classify_with_droid(
+    files: list[FileStat],
+    model_name: str,
+    max_chars: int,
+    threshold: float,
+    hud: ScanHud | None = None,
+) -> dict[str, Any]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("install AI dependencies with `uv tool install 'reposcanner[ai]'` or `uv sync --extra ai`") from exc
+
+    if hud:
+        hud.log(f"Loading AI-code detector [bold]{model_name}[/bold]")
+    tokenizer, model, labels = load_droid_model(model_name)
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    model.to(device)
+    model.eval()
+
+    configured_max_length = getattr(tokenizer, "model_max_length", 4096) or 4096
+    if configured_max_length > 100_000:
+        configured_max_length = 4096
+    max_length = min(int(configured_max_length), 8192)
+    generated_indexes: set[int] | None = None
+    records: list[dict[str, Any]] = []
+    if hud:
+        hud.task("ai", "Detecting AI code", len(files))
+    for stat in files:
+        full_text = read_text(stat.path)
+        chunk_probabilities: list[float] = []
+        chunk_labels: list[str] = []
+        for text in detector_chunks(full_text, max_chars):
+            encoded = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.no_grad():
+                output = model(**encoded)
+                logits = output["logits"] if isinstance(output, dict) else output.logits
+                probabilities = torch.softmax(logits[0].detach().cpu(), dim=-1).tolist()
+            if generated_indexes is None:
+                generated_indexes = ai_generated_label_indexes(labels, len(probabilities))
+            generated_probability = sum(probabilities[index] for index in generated_indexes if index < len(probabilities))
+            predicted_index = max(range(len(probabilities)), key=lambda index: probabilities[index])
+            chunk_probabilities.append(float(generated_probability))
+            chunk_labels.append(labels.get(predicted_index, f"LABEL_{predicted_index}"))
+        droid_probability = max(chunk_probabilities) if chunk_probabilities else 0.0
+        best_chunk_index = chunk_probabilities.index(droid_probability) if chunk_probabilities else 0
+        droid_label = chunk_labels[best_chunk_index] if chunk_labels else "unknown"
+        guardrail_probability = heuristic_ai_probability(stat, detector_snippet(full_text, max_chars))
+        final_probability = max(droid_probability, guardrail_probability)
+        predicted_label = droid_label
+        if guardrail_probability > droid_probability:
+            predicted_label = "MACHINE_GENERATED_HEURISTIC_GUARDRAIL" if final_probability >= 0.50 else "HUMAN_GENERATED_LIKELY"
+        records.append(
+            {
+                "path": stat.rel,
+                "language": stat.language,
+                "code_loc": stat.code_loc,
+                "ai_probability": round(float(final_probability), 6),
+                "human_probability": round(float(1.0 - final_probability), 6),
+                "droid_ai_probability": round(float(droid_probability), 6),
+                "heuristic_guardrail_probability": round(float(guardrail_probability), 6),
+                "droid_chunk_ai_probabilities": [round(value, 6) for value in chunk_probabilities],
+                "droid_predicted_label": droid_label,
+                "predicted_label": predicted_label,
+                "detector": "droiddetect_chunked_with_heuristic_guardrail",
+            }
+        )
+        if hud:
+            hud.advance("ai")
+    if hud:
+        hud.complete("ai")
+    return summarize_ai_detection(
+        records,
+        backend="droid",
+        model_name=model_name,
+        threshold=threshold,
+        notes=[
+            "Repository-level percent is LOC-weighted over sampled real source files.",
+            "DroidDetect scores head/middle/tail chunks for long files and uses the strongest generated-code signal per file.",
+            "A local heuristic guardrail is recorded and can raise the final per-file probability when DroidDetect under-detects generated utility code.",
+            "Dependency, generated, build, and virtual environment folders are excluded before detection.",
+            "DroidDetect scores are probabilistic and should be used as a sale gate plus appeal signal.",
+        ],
+    )
+
+
+def heuristic_ai_probability(stat: FileStat, text: str) -> float:
+    nonblank = [line.strip() for line in text.splitlines() if line.strip()]
+    if not nonblank:
+        return 0.0
+    lowered = text.lower()
+    score = 0.30
+    if stat.code_loc >= 1000:
+        score += 0.28
+    elif stat.code_loc >= 300:
+        score += 0.20
+    elif stat.code_loc >= 80:
+        score += 0.10
+    comment_ratio = stat.comment_loc / max(stat.code_loc, 1)
+    if 0.02 <= comment_ratio <= 0.22:
+        score += 0.06
+    if stat.language in {"Python", "TypeScript", "JavaScript", "Java", "Kotlin", "C#", "Go", "Rust"}:
+        functions = len(FUNC_RE.findall(text))
+        if functions >= 20:
+            score += 0.10
+        elif functions >= 6:
+            score += 0.06
+    if stat.language == "Python":
+        typed_defs = len(re.findall(r"def\s+\w+\([^)]*\)\s*->\s*[\w\[\], |.]+:", text))
+        typed_args = len(re.findall(r"\b\w+:\s*[A-Za-z_][\w.[\], |]*", text))
+        if typed_defs >= 8 or typed_args >= 30:
+            score += 0.12
+    repeated_phrases = sum(lowered.count(phrase) for phrase in ("helper", "metadata", "fallback", "threshold", "schema"))
+    if repeated_phrases >= 25:
+        score += 0.06
+    long_lines = sum(1 for line in nonblank if len(line) > 100)
+    if long_lines / max(len(nonblank), 1) < 0.12:
+        score += 0.04
+    human_markers = ("todo", "fixme", "hack", "wtf", "temporary", "quick and dirty", "console.log(")
+    if any(marker in lowered for marker in human_markers):
+        score -= 0.10
+    if "generated by" in lowered or "do not edit" in lowered:
+        score += 0.25
+    return clamp01(score)
+
+
+def classify_with_heuristic(files: list[FileStat], max_chars: int, threshold: float, hud: ScanHud | None = None) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    if hud:
+        hud.task("ai", "Heuristic AI-code scan", len(files))
+    for stat in files:
+        text = detector_snippet(read_text(stat.path), max_chars)
+        probability = heuristic_ai_probability(stat, text)
+        label = "MACHINE_GENERATED_LIKELY" if probability >= 0.50 else "HUMAN_GENERATED_LIKELY"
+        records.append(
+            {
+                "path": stat.rel,
+                "language": stat.language,
+                "code_loc": stat.code_loc,
+                "ai_probability": round(probability, 6),
+                "human_probability": round(1.0 - probability, 6),
+                "predicted_label": label,
+                "detector": "heuristic_fallback",
+            }
+        )
+        if hud:
+            hud.advance("ai")
+    if hud:
+        hud.complete("ai")
+    return summarize_ai_detection(
+        records,
+        backend="heuristic",
+        model_name="local_heuristic_v1",
+        threshold=threshold,
+        notes=[
+            "Heuristic fallback is low-confidence and exists so the scan remains runnable without model dependencies.",
+            "Use the DroidDetect backend for sale decisions whenever possible.",
+            "Dependency, generated, build, and virtual environment folders are excluded before detection.",
+        ],
+    )
+
+
+def detect_ai_generated_code(
+    stats: list[FileStat],
+    *,
+    backend: str,
+    model_name: str,
+    max_files: int,
+    max_chars: int,
+    threshold: float,
+    fallback_heuristic: bool,
+    hud: ScanHud | None = None,
+) -> dict[str, Any]:
+    files = select_ai_detection_files(stats, max_files)
+    if not files:
+        return summarize_ai_detection(
+            [],
+            backend=backend,
+            model_name=model_name if backend == "droid" else "local_heuristic_v1",
+            threshold=threshold,
+            notes=["No eligible real source files were available for AI-code detection."],
+            status="completed",
+        )
+    if backend == "heuristic":
+        return classify_with_heuristic(files, max_chars, threshold, hud)
+    try:
+        return classify_with_droid(files, model_name, max_chars, threshold, hud)
+    except Exception as exc:
+        if not fallback_heuristic:
+            return summarize_ai_detection(
+                [],
+                backend="droid",
+                model_name=model_name,
+                threshold=threshold,
+                notes=["DroidDetect backend failed and heuristic fallback was disabled."],
+                status="unavailable",
+                detector_error=str(exc),
+            )
+        if hud:
+            hud.log(f"[yellow]DroidDetect unavailable; using heuristic fallback ({exc})[/yellow]")
+        result = classify_with_heuristic(files, max_chars, threshold, hud)
+        result["backend"] = "heuristic_fallback_after_droid_error"
+        result["requested_model"] = model_name
+        result["detector_error"] = str(exc)[:500]
+        result["notes"].insert(0, "DroidDetect backend failed; heuristic fallback was used.")
+        return result
+
+
+ANONYMIZATION_STOPWORDS = {
+    "admin",
+    "api",
+    "app",
+    "build",
+    "client",
+    "code",
+    "config",
+    "core",
+    "data",
+    "default",
+    "dev",
+    "docs",
+    "example",
+    "github",
+    "gitlab",
+    "main",
+    "package",
+    "prod",
+    "project",
+    "repo",
+    "sample",
+    "server",
+    "service",
+    "source",
+    "src",
+    "test",
+    "user",
+    "web",
+}
+
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\w)")
+URL_RE = re.compile(r"\b(?:https?|ssh|git)://[^\s\"'<>]+", re.I)
+IP_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+MENTION_RE = re.compile(r"(?<![\w/])@[A-Za-z0-9][A-Za-z0-9_-]{1,38}\b")
+USER_PATH_RE = re.compile(r"(?P<prefix>(?:/Users|/home)/)(?P<user>[^/\s\"']+)")
+PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.S,
+)
+KNOWN_SECRET_RE = re.compile(
+    r"\b(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"ASIA[0-9A-Z]{16}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,255}|"
+    r"github_pat_[A-Za-z0-9_]{20,255}|"
+    r"glpat-[A-Za-z0-9_-]{20,255}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,255}|"
+    r"sk_live_[A-Za-z0-9]{20,255}|"
+    r"rk_live_[A-Za-z0-9]{20,255}|"
+    r"AIza[0-9A-Za-z_-]{35}|"
+    r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"
+    r")\b"
+)
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|"
+    r"access[_-]?token|refresh[_-]?token|private[_-]?key|dsn)\b\s*[:=]\s*[\"']?)"
+    r"(?P<value>[^\"'\s,;]{8,})"
+    r"(?P<suffix>[\"']?)",
+    re.I,
+)
+HOST_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>\b(?:host|hostname|server|endpoint|base[_-]?url|api[_-]?url|url)\b\s*[:=]\s*[\"']?)"
+    r"(?P<value>(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:/[^\s\"',;]*)?)"
+    r"(?P<suffix>[\"']?)",
+    re.I,
+)
+KEYED_NAME_QUOTED_RE = re.compile(
+    r"(?P<prefix>\b(?:author|owner|maintainer|name|company|organization|org|client|customer|contact)\b"
+    r"\s*[:=]\s*[\"'])"
+    r"(?P<value>[^\"']{2,80})"
+    r"(?P<suffix>[\"'])",
+    re.I,
+)
+KEYED_NAME_UNQUOTED_RE = re.compile(
+    r"(?P<prefix>\b(?:company|organization|org|client|customer|contact)\b\s*[:=]\s*)"
+    r"(?P<value>[A-Z][A-Za-z0-9 &._-]{2,80})$",
+    re.I | re.M,
+)
+HIGH_ENTROPY_RE = re.compile(r"\b[A-Za-z0-9+/=_]{32,}\b")
+
+
+def shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts = Counter(value)
+    length = len(value)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+
+def normalized_term(term: str) -> str:
+    return re.sub(r"\s+", " ", term.strip())
+
+
+def useful_anonymization_term(term: str) -> bool:
+    term = normalized_term(term)
+    lowered = term.lower()
+    if len(term) < 4 or lowered in ANONYMIZATION_STOPWORDS:
+        return False
+    if re.fullmatch(r"[\W_]+", term):
+        return False
+    return True
+
+
+def git_remote_identity_terms(repo: Path) -> set[str]:
+    terms: set[str] = set()
+    remote_output = run(["git", "remote", "-v"], repo)
+    for owner, name in re.findall(r"[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\s|\)|$)", remote_output):
+        terms.update({owner, name.removesuffix(".git")})
+    return terms
+
+
+def git_author_identity_terms(repo: Path) -> set[str]:
+    terms: set[str] = set()
+    output = run(["git", "log", "--all", "--format=%an%x00%ae", "-n", "2000"], repo)
+    for line in output.splitlines():
+        if "\0" in line:
+            name, email = line.split("\0", 1)
+        else:
+            name, email = line, ""
+        if useful_anonymization_term(name):
+            terms.add(name)
+        if email and "@" in email:
+            local = email.split("@", 1)[0]
+            for part in re.split(r"[._+-]+", local):
+                if useful_anonymization_term(part):
+                    terms.add(part)
+    return terms
+
+
+def manifest_identity_terms(repo: Path) -> set[str]:
+    terms: set[str] = {repo.name}
+    package_json = repo / "package.json"
+    if package_json.exists():
+        try:
+            package = json.loads(read_text(package_json))
+        except json.JSONDecodeError:
+            package = {}
+        if isinstance(package, dict):
+            for key in ("name", "author", "homepage"):
+                value = package.get(key)
+                if isinstance(value, str):
+                    terms.add(value.split("/")[-1] if key == "name" else value)
+    pyproject = repo / "pyproject.toml"
+    if pyproject.exists():
+        text = read_text(pyproject)
+        for match in re.findall(r"(?m)^\s*(?:name|authors?)\s*=\s*[\"']([^\"']+)[\"']", text):
+            terms.add(match)
+    return {term for term in terms if useful_anonymization_term(term)}
+
+
+def default_anonymization_terms(repo: Path) -> list[str]:
+    terms = set()
+    terms.update(git_remote_identity_terms(repo))
+    terms.update(git_author_identity_terms(repo))
+    terms.update(manifest_identity_terms(repo))
+    return sorted((term for term in terms if useful_anonymization_term(term)), key=lambda value: (-len(value), value.lower()))
+
+
+def load_anonymization_terms(paths: list[str] | None) -> list[str]:
+    terms: list[str] = []
+    for raw_path in paths or []:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        for line in read_text(path).splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                terms.append(line)
+    return terms
+
+
+class RepoAnonymizer:
+    def __init__(self, *, enabled: bool, terms: list[str] | None = None) -> None:
+        self.enabled = enabled
+        self.terms = []
+        seen_terms = set()
+        for term in terms or []:
+            term = normalized_term(term)
+            lowered = term.lower()
+            if useful_anonymization_term(term) and lowered not in seen_terms:
+                self.terms.append(term)
+                seen_terms.add(lowered)
+        self.terms.sort(key=lambda value: (-len(value), value.lower()))
+        self._values: dict[tuple[str, str], str] = {}
+        self._tag_counts: Counter[str] = Counter()
+        self._replacement_events: Counter[str] = Counter()
+
+    def placeholder(self, tag: str, value: str, *, numbered: bool = True) -> str:
+        tag = tag.upper()
+        self._replacement_events[tag] += 1
+        if tag == "SECRET" or not numbered:
+            self._tag_counts[tag] += 1
+            return f"[{tag}]"
+        key = (tag, value.strip().lower())
+        if key not in self._values:
+            self._tag_counts[tag] += 1
+            self._values[key] = f"[{tag}_{self._tag_counts[tag]:03d}]"
+        return self._values[key]
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "mode": "local_regex_entropy_deterministic_tags" if self.enabled else "disabled",
+            "identity_terms_loaded": len(self.terms),
+            "replacement_events_by_tag": dict(sorted(self._replacement_events.items())),
+            "unique_replacements_by_tag": dict(sorted(self._tag_counts.items())),
+            "notes": [
+                "Anonymization runs locally and does not send code to external APIs.",
+                "Secrets are redacted; identity values are replaced with deterministic tags.",
+                "Add --anonymize-term or --anonymize-terms-file for company/project names the local heuristics cannot infer.",
+            ],
+        }
+
+    def sanitize_text(self, text: str) -> str:
+        if not self.enabled or not text:
+            return text
+        text = PRIVATE_KEY_RE.sub(lambda match: self.placeholder("SECRET", match.group(0), numbered=False), text)
+        text = KNOWN_SECRET_RE.sub(lambda match: self.placeholder("SECRET", match.group(0), numbered=False), text)
+        text = SECRET_ASSIGNMENT_RE.sub(
+            lambda match: (
+                f"{match.group('prefix')}{self.placeholder('SECRET', match.group('value'), numbered=False)}{match.group('suffix')}"
+            ),
+            text,
+        )
+        text = HIGH_ENTROPY_RE.sub(
+            lambda match: (
+                self.placeholder("SECRET", match.group(0), numbered=False) if shannon_entropy(match.group(0)) >= 4.25 else match.group(0)
+            ),
+            text,
+        )
+        text = EMAIL_RE.sub(lambda match: self.placeholder("EMAIL", match.group(0)), text)
+        text = PHONE_RE.sub(lambda match: self.placeholder("PHONE", match.group(0)), text)
+        text = URL_RE.sub(lambda match: self.placeholder("URL", match.group(0)), text)
+        text = HOST_ASSIGNMENT_RE.sub(
+            lambda match: f"{match.group('prefix')}{self.placeholder('URL', match.group('value'))}{match.group('suffix')}",
+            text,
+        )
+        text = IP_RE.sub(lambda match: self.placeholder("IP", match.group(0)), text)
+        text = USER_PATH_RE.sub(lambda match: f"{match.group('prefix')}{self.placeholder('USER', match.group('user'))}", text)
+        text = MENTION_RE.sub(lambda match: self.placeholder("USER", match.group(0)[1:]), text)
+
+        def replace_keyed_name(match: re.Match[str]) -> str:
+            key_text = match.group("prefix").lower()
+            tag = "ORG" if any(word in key_text for word in ("company", "organization", "org", "client", "customer")) else "NAME"
+            return f"{match.group('prefix')}{self.placeholder(tag, match.group('value'))}{match.group('suffix')}"
+
+        text = KEYED_NAME_QUOTED_RE.sub(replace_keyed_name, text)
+        text = KEYED_NAME_UNQUOTED_RE.sub(
+            lambda match: f"{match.group('prefix')}{self.placeholder('ORG', match.group('value'))}",
+            text,
+        )
+        for term in self.terms:
+            tag = "ORG" if any(part in term.lower() for part in ("inc", "llc", "corp", "labs", "studio", "systems")) else "NAME"
+            pattern = re.compile(rf"(?<![\w.-]){re.escape(term)}(?![\w.-])", re.I)
+            text = pattern.sub(lambda match, tag=tag: self.placeholder(tag, match.group(0)), text)
+        return text
+
+
 def close_enough_to_whole_repo(target_lines: int, logical_loc: int) -> bool:
     if logical_loc <= 0 or target_lines <= 0:
         return False
     ratio = target_lines / logical_loc
-    return (
-        logical_loc <= SMALL_REPO_MAX_LOGICAL_LOC
-        and (ratio >= SMALL_REPO_CLOSE_RATIO or abs(logical_loc - target_lines) <= SMALL_REPO_ABS_TOLERANCE)
+    return logical_loc <= SMALL_REPO_MAX_LOGICAL_LOC and (
+        ratio >= SMALL_REPO_CLOSE_RATIO or abs(logical_loc - target_lines) <= SMALL_REPO_ABS_TOLERANCE
     )
 
 
@@ -1036,10 +1685,7 @@ def sample_quality(primary_language: str, primary_lines: int, logical_loc: int) 
         reason = f"{primary_lines} counted {primary_language} lines meets 5,000+ target."
     elif primary_lines >= UNDER_FAIL_MIN_PRIMARY_LANGUAGE_LOC:
         status = "PASS_UNDER_5K_ABOVE_1K"
-        reason = (
-            f"{primary_lines} counted {primary_language} lines is below the 5,000 target, "
-            "but above the 1,000-line failure floor."
-        )
+        reason = f"{primary_lines} counted {primary_language} lines is below the 5,000 target, but above the 1,000-line failure floor."
     elif close_enough_to_whole_repo(primary_lines, logical_loc):
         status = "PASS_SMALL_WHOLE_PROJECT"
         reason = (
@@ -1102,9 +1748,7 @@ SUPPORT_FILE_NAMES = {
 
 def select_sample_files(stats: list[FileStat], primary_language: str) -> list[FileStat]:
     primary = [
-        stat
-        for stat in stats
-        if not stat.dependency and not stat.generated and stat.language == primary_language and stat.code_loc > 0
+        stat for stat in stats if not stat.dependency and not stat.generated and stat.language == primary_language and stat.code_loc > 0
     ]
     primary.sort(key=lambda stat: (-stat.code_loc, stat.rel))
     selected: list[FileStat] = []
@@ -1143,6 +1787,7 @@ def write_sample_zip(
     row: dict[str, Any],
     stats: list[FileStat],
     output: str | None,
+    anonymizer: RepoAnonymizer | None = None,
 ) -> dict[str, Any]:
     primary_language = str(row.get("primary_language") or "")
     selected = select_sample_files(stats, primary_language)
@@ -1155,6 +1800,11 @@ def write_sample_zip(
             "zip_shape": "data/{repo_id}/samples/...",
         }
     )
+    ai_detection = row.get("ai_code_detection")
+    if isinstance(ai_detection, dict):
+        quality["ai_generated_code_percent"] = ai_detection.get("ai_generated_code_percent")
+        quality["ai_gate_status"] = ai_detection.get("sale_gate_status")
+        quality["requires_explanation_or_appeal"] = ai_detection.get("requires_explanation_or_appeal")
     out = sample_zip_path(output, repo_id).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     base = f"data/{repo_id}"
@@ -1162,6 +1812,7 @@ def write_sample_zip(
         "repo_id": repo_id,
         "created_by": "reposcanner",
         "anonymization_required_before_sharing": True,
+        "anonymization": {"enabled": bool(anonymizer and anonymizer.enabled)},
         "sample_quality": quality,
         "files": [{"path": stat.rel, "language": stat.language, "code_loc": stat.code_loc} for stat in selected],
     }
@@ -1173,12 +1824,24 @@ def write_sample_zip(
     )
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for stat in selected:
-            zf.write(stat.path, f"{base}/samples/{stat.rel}")
+            text = read_text(stat.path)
+            if anonymizer:
+                text = anonymizer.sanitize_text(text)
+            zf.writestr(f"{base}/samples/{stat.rel}", text)
+        if anonymizer:
+            summary = anonymizer.sanitize_text(summary)
         zf.writestr(f"{base}/repo_summary.md", summary)
-        zf.writestr(f"{base}/metadata.json", json.dumps(row, indent=2, ensure_ascii=False))
+        metadata_json = json.dumps(row, indent=2, ensure_ascii=False)
+        if anonymizer:
+            metadata_json = anonymizer.sanitize_text(metadata_json)
+        zf.writestr(f"{base}/metadata.json", metadata_json)
+        if anonymizer:
+            manifest["anonymization"] = anonymizer.report()
         zf.writestr(f"{base}/sample_quality.json", json.dumps(quality, indent=2, ensure_ascii=False))
         zf.writestr(f"{base}/sample_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
-    quality["zip_path"] = str(out)
+        if anonymizer:
+            zf.writestr(f"{base}/anonymization_report.json", json.dumps(anonymizer.report(), indent=2, ensure_ascii=False))
+    quality["zip_path"] = out.name
     quality["zip_bytes"] = out.stat().st_size
     return quality
 
@@ -1288,12 +1951,25 @@ def build_metadata(
     *,
     include_token_stats: bool = False,
     include_sale_prediction: bool = True,
+    include_ai_detection: bool = False,
+    ai_detector_backend: str = "droid",
+    ai_detector_model: str = DEFAULT_AI_DETECTOR_MODEL,
+    ai_detector_max_files: int = 8,
+    ai_detector_max_chars: int = 12_000,
+    ai_detection_threshold: float = AI_GENERATED_REJECTION_THRESHOLD,
+    ai_fallback_heuristic: bool = True,
     prep_sample: bool = False,
     sample_output: str | None = None,
+    anonymize: bool = True,
+    anonymization_terms: list[str] | None = None,
     description: str | None = None,
     hud: ScanHud | None = None,
 ) -> dict:
     stats = collect_file_stats(repo, hud)
+    anonymizer = RepoAnonymizer(
+        enabled=anonymize,
+        terms=[*default_anonymization_terms(repo), *(anonymization_terms or [])],
+    )
     no_deps = [s for s in stats if not s.dependency]
     if hud:
         hud.task("metrics", "Computing metrics", 8)
@@ -1379,7 +2055,7 @@ def build_metadata(
     }
     row = {column: row.get(column) for column in METADATA_COLUMNS}
     if description:
-        row["repo_description"] = description
+        row["repo_description"] = anonymizer.sanitize_text(description)
     if include_token_stats:
         if hud:
             hud.log("Estimating code tokens")
@@ -1390,14 +2066,42 @@ def build_metadata(
         prediction = predict_sale(row)
         if prediction:
             row["sale_prediction"] = prediction
+    if include_ai_detection:
+        if hud:
+            hud.log("Running AI-generated code detector")
+        ai_detection = detect_ai_generated_code(
+            no_deps,
+            backend=ai_detector_backend,
+            model_name=ai_detector_model,
+            max_files=ai_detector_max_files,
+            max_chars=ai_detector_max_chars,
+            threshold=ai_detection_threshold,
+            fallback_heuristic=ai_fallback_heuristic,
+            hud=hud,
+        )
+        row["ai_generated_code_percent"] = ai_detection["ai_generated_code_percent"]
+        row["ai_generated_code_ratio"] = ai_detection["ai_generated_code_ratio"]
+        row["ai_generated_code_sale_gate"] = ai_detection["sale_gate_status"]
+        row["ai_generated_code_requires_appeal"] = ai_detection["requires_explanation_or_appeal"]
+        row["ai_code_detection"] = ai_detection
+        if isinstance(row.get("sale_prediction"), dict):
+            row["sale_prediction"]["ai_gate_status"] = ai_detection["sale_gate_status"]
+            row["sale_prediction"]["eligible_without_ai_appeal"] = not ai_detection["requires_explanation_or_appeal"]
     if prep_sample:
         if hud:
             hud.log("Preparing anonymized-sample zip structure")
             hud.task("sample", "Writing sample zip", 1)
-        quality = write_sample_zip(repo, repo_id, row, stats, sample_output)
+        quality = write_sample_zip(repo, repo_id, row, stats, sample_output, anonymizer if anonymize else None)
+        if include_ai_detection and isinstance(row.get("ai_code_detection"), dict):
+            ai_detection = row["ai_code_detection"]
+            quality["ai_generated_code_percent"] = ai_detection["ai_generated_code_percent"]
+            quality["ai_gate_status"] = ai_detection["sale_gate_status"]
+            quality["requires_explanation_or_appeal"] = ai_detection["requires_explanation_or_appeal"]
         row["sample_quality"] = quality
         if hud:
             hud.complete("sample")
+    if anonymize:
+        row["anonymization"] = anonymizer.report()
     if hud:
         hud.complete("metrics")
         hud.summary(row, stats)
@@ -1455,27 +2159,45 @@ def description_prompt() -> str:
 
 
 def scan_command(args: argparse.Namespace) -> int:
-    repo = Path(args.repo).resolve()
+    repo = Path(args.path or args.repo).resolve()
     if not repo.exists() or not repo.is_dir():
         print(f"repo not found: {repo}", file=sys.stderr)
         return 2
+    if not 0 <= args.ai_threshold <= 1:
+        print("--ai-threshold must be a ratio from 0 to 1, for example 0.10 for 10%", file=sys.stderr)
+        return 2
     repo_id = args.repo_id or str(uuid.uuid4())
     bundle_path = Path(args.bundle_path).resolve() if args.bundle_path else None
+    output_dir = Path(args.output_dir).resolve()
+    sample_output = args.sample_output or str(output_dir)
+    explicit_terms = list(args.anonymize_term or [])
+    explicit_terms.extend(load_anonymization_terms(args.anonymize_terms_file))
     description = None
     if args.description:
         description = args.description
     elif args.description_file:
         description = Path(args.description_file).read_text(encoding="utf-8").strip()
     with ScanHud(args.hud) as hud:
+        if args.refresh_git:
+            refresh_git_refs(repo, hud)
         row = build_metadata(
             repo,
             repo_id,
             bundle_path,
             args.sample_loc,
-            include_token_stats=args.schema == "extended",
-            include_sale_prediction=args.schema == "extended",
+            include_token_stats=args.schema == "extended" and args.token_stats,
+            include_sale_prediction=args.schema == "extended" and args.sale_prediction,
+            include_ai_detection=args.schema == "extended" and args.ai_detect,
+            ai_detector_backend=args.ai_detector_backend,
+            ai_detector_model=args.ai_model,
+            ai_detector_max_files=args.ai_max_files,
+            ai_detector_max_chars=args.ai_max_chars,
+            ai_detection_threshold=args.ai_threshold,
+            ai_fallback_heuristic=args.ai_fallback_heuristic,
             prep_sample=args.prep_sample,
-            sample_output=args.sample_output,
+            sample_output=sample_output,
+            anonymize=args.anonymize,
+            anonymization_terms=explicit_terms,
             description=description,
             hud=hud,
         )
@@ -1485,7 +2207,13 @@ def scan_command(args: argparse.Namespace) -> int:
     if args.output == "-":
         print(text)
     else:
-        Path(args.output).write_text(text + "\n", encoding="utf-8")
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            suffix = "yaml" if args.format == "yaml" else args.format
+            output_path = output_dir / f"metadata.{suffix}"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text + "\n", encoding="utf-8")
     return 0
 
 
@@ -1494,27 +2222,129 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command")
 
     scan = subparsers.add_parser("scan", help="Scan a repository and emit one metadata row.")
+    scan.add_argument("path", nargs="?", help="Repository root positional shortcut; same as --repo.")
     scan.add_argument("--repo", default=".", help="Repository root. Default: current directory.")
     scan.add_argument("--repo-id", default=None, help="Repository UUID. Default: generate a UUID4.")
     scan.add_argument("--bundle-path", default=None, help="Optional .bundle/.zip path for repo_bundle_mb.")
     scan.add_argument("--sample-loc", type=int, default=None, help="Optional explicit sample_loc value. Default: logical_loc.")
-    scan.add_argument("--schema", choices=["extended", "core"], default="extended", help="extended adds token_stats; core emits only the 30 source metadata columns.")
+    scan.add_argument(
+        "--schema",
+        choices=["extended", "core"],
+        default="extended",
+        help="extended adds token_stats; core emits only the 30 source metadata columns.",
+    )
     scan.add_argument("--format", choices=["json", "jsonl", "yaml"], default="json", help="Output format.")
     scan.add_argument("--description", default=None, help="Optional repo description string to include in extended output.")
     scan.add_argument("--description-file", default=None, help="Optional file containing repo description text.")
-    scan.add_argument("--output", "-o", default="-", help="Output path, or '-' for stdout.")
+    scan.add_argument(
+        "--output", "-o", default=None, help=f"Metadata output path, or '-' for stdout. Default: ./{DEFAULT_OUTPUT_DIR}/metadata.<format>."
+    )
+    scan.add_argument(
+        "--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Default folder for metadata/sample outputs. Default: ./{DEFAULT_OUTPUT_DIR}."
+    )
     scan.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
-    scan.add_argument("--prep-sample", action="store_true", help="Create a customer-facing code sample zip. Anonymize the repository before using this.")
-    scan.add_argument("--sample-output", default=None, help="Sample zip path or output directory. Default: ./<repo_id>_sample.zip")
+    sample_group = scan.add_mutually_exclusive_group()
+    sample_group.add_argument(
+        "--prep-sample",
+        dest="prep_sample",
+        action="store_true",
+        default=True,
+        help="Create a customer-facing code sample zip. Enabled by default.",
+    )
+    sample_group.add_argument("--no-prep-sample", dest="prep_sample", action="store_false", help="Skip sample zip creation.")
+    scan.add_argument(
+        "--sample-output", default=None, help=f"Sample zip path or output directory. Default: ./{DEFAULT_OUTPUT_DIR}/<repo_id>_sample.zip"
+    )
+    token_group = scan.add_mutually_exclusive_group()
+    token_group.add_argument(
+        "--token-stats",
+        dest="token_stats",
+        action="store_true",
+        default=True,
+        help="Add token estimates to extended metadata. Enabled by default.",
+    )
+    token_group.add_argument("--no-token-stats", dest="token_stats", action="store_false", help="Skip token estimates.")
+    sale_group = scan.add_mutually_exclusive_group()
+    sale_group.add_argument(
+        "--sale-prediction",
+        dest="sale_prediction",
+        action="store_true",
+        default=True,
+        help="Add local sale-fit tier/probability. Enabled by default.",
+    )
+    sale_group.add_argument("--no-sale-prediction", dest="sale_prediction", action="store_false", help="Skip sale-fit scoring.")
+    ai_group = scan.add_mutually_exclusive_group()
+    ai_group.add_argument(
+        "--ai-detect",
+        dest="ai_detect",
+        action="store_true",
+        default=True,
+        help="Add AI-generated code detection to extended metadata. Enabled by default.",
+    )
+    ai_group.add_argument("--no-ai-detect", dest="ai_detect", action="store_false", help="Skip AI-generated code detection.")
+    scan.add_argument(
+        "--ai-detector-backend", choices=["droid", "heuristic"], default="droid", help="AI-code detector backend. Default: droid."
+    )
+    scan.add_argument(
+        "--ai-model",
+        default=DEFAULT_AI_DETECTOR_MODEL,
+        help=f"Hugging Face model for --ai-detector-backend droid. Default: {DEFAULT_AI_DETECTOR_MODEL}",
+    )
+    scan.add_argument(
+        "--ai-max-files", type=int, default=8, help="Maximum largest real source files to score for AI detection. Default: 8."
+    )
+    scan.add_argument(
+        "--ai-max-chars", type=int, default=12_000, help="Maximum characters sampled per file for AI detection. Default: 12000."
+    )
+    scan.add_argument(
+        "--ai-threshold",
+        type=float,
+        default=AI_GENERATED_REJECTION_THRESHOLD,
+        help="AI-generated code ratio above which sale requires explanation/appeal. Default: 0.10.",
+    )
+    scan.add_argument(
+        "--no-ai-fallback-heuristic",
+        dest="ai_fallback_heuristic",
+        action="store_false",
+        default=True,
+        help="Do not use the local heuristic if DroidDetect cannot load.",
+    )
+    anonymize_group = scan.add_mutually_exclusive_group()
+    anonymize_group.add_argument(
+        "--anonymize",
+        dest="anonymize",
+        action="store_true",
+        default=True,
+        help="Anonymize generated sample/description outputs. Enabled by default.",
+    )
+    anonymize_group.add_argument("--no-anonymize", dest="anonymize", action="store_false", help="Do not anonymize generated outputs.")
+    scan.add_argument(
+        "--anonymize-term",
+        action="append",
+        default=[],
+        help="Extra company/project/person term to replace in generated outputs. Repeatable.",
+    )
+    scan.add_argument(
+        "--anonymize-terms-file", action="append", default=[], help="File with one extra anonymization term per line. Repeatable."
+    )
+    scan.add_argument(
+        "--refresh-git", action="store_true", help="Fetch all git refs/tags before scanning metadata. Does not pull or modify branches."
+    )
     hud_group = scan.add_mutually_exclusive_group()
-    hud_group.add_argument("--hud", dest="hud", action="store_true", default=True, help="Show the rich progress HUD on stderr. Enabled by default.")
+    hud_group.add_argument(
+        "--hud", dest="hud", action="store_true", default=True, help="Show the rich progress HUD on stderr. Enabled by default."
+    )
     hud_group.add_argument("--no-hud", dest="hud", action="store_false", help="Disable the rich progress HUD.")
 
     subparsers.add_parser("description-prompt", help="Print the Codex prompt for writing repo descriptions.")
-    args = parser.parse_args()
-    if args.command in (None, "scan"):
-        if args.command is None:
-            args = parser.parse_args(["scan", *sys.argv[1:]])
+    argv = sys.argv[1:]
+    known_commands = {"scan", "description-prompt"}
+    if not argv or argv[0].startswith("-"):
+        argv = ["scan", *argv]
+    elif argv[0] not in known_commands:
+        argv = ["scan", *argv]
+    args = parser.parse_args(argv)
+    if args.command == "scan":
         return scan_command(args)
     if args.command == "description-prompt":
         print(description_prompt())
