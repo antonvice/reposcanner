@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate a Fermatix-style repository metadata JSON row.
+"""Generate a repository metadata JSON row.
 
 Run from a repository root:
 
-    python3 /path/to/fermatix_repo_metadata.py --output metadata.json
+    reposcanner scan --repo . --output metadata.json
 
 The script intentionally uses only the Python standard library. If the `scc`
 binary is available in the environment you can still use this script; it does
@@ -887,7 +887,7 @@ def scan_command(args: argparse.Namespace) -> int:
         include_token_stats=args.schema == "extended",
         description=description,
     )
-    if args.schema == "fermatix":
+    if args.schema == "core":
         row = {column: row.get(column) for column in METADATA_COLUMNS}
     text = format_row(row, args.format, args.pretty)
     if args.output == "-":
@@ -906,7 +906,7 @@ def main() -> int:
     scan.add_argument("--repo-id", default=None, help="Repository UUID. Default: generate a UUID4.")
     scan.add_argument("--bundle-path", default=None, help="Optional .bundle/.zip path for repo_bundle_mb.")
     scan.add_argument("--sample-loc", type=int, default=None, help="Optional explicit sample_loc value. Default: logical_loc.")
-    scan.add_argument("--schema", choices=["extended", "fermatix"], default="extended", help="extended adds token_stats; fermatix emits only the 30 source metadata columns.")
+    scan.add_argument("--schema", choices=["extended", "core"], default="extended", help="extended adds token_stats; core emits only the 30 source metadata columns.")
     scan.add_argument("--format", choices=["json", "jsonl", "yaml"], default="json", help="Output format.")
     scan.add_argument("--description", default=None, help="Optional repo description string to include in extended output.")
     scan.add_argument("--description-file", default=None, help="Optional file containing repo description text.")

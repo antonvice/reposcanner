@@ -1,6 +1,6 @@
 # reposcanner
 
-`reposcanner` is a small CLI for generating one repository metadata row in the same shape as the Fermatix-style metadata table used for code dataset QA.
+`reposcanner` is a small CLI for generating one repository metadata row for code dataset QA.
 
 It runs locally inside a checked-out repository and emits JSON, JSONL, or YAML. It has no runtime dependencies beyond Python.
 
@@ -37,16 +37,16 @@ Run inside the repository you want to scan:
 reposcanner scan --repo . --pretty --output repo_metadata.json
 ```
 
-Strict Fermatix-style columns only:
+Core metadata columns only:
 
 ```bash
-reposcanner scan --repo . --schema fermatix --format json --pretty --output repo_metadata.json
+reposcanner scan --repo . --schema core --format json --pretty --output repo_metadata.json
 ```
 
 JSONL:
 
 ```bash
-reposcanner scan --repo . --schema fermatix --format jsonl --output repo_metadata.jsonl
+reposcanner scan --repo . --schema core --format jsonl --output repo_metadata.jsonl
 ```
 
 YAML:
@@ -76,7 +76,7 @@ Default schema is `extended`. It emits the base metadata columns plus useful loc
 - `token_stats.tokens_by_language`
 - `token_stats.tokens_by_extension`
 
-Use `--schema fermatix` when you want only the source metadata columns:
+Use `--schema core` when you want only the source metadata columns:
 
 ```text
 repo_id

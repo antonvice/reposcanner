@@ -6,7 +6,7 @@ Requirements:
 - Output only one paragraph, 2-4 sentences.
 - Describe the product/domain, main user-facing purpose, and the most important technical components.
 - Mention the primary programming language/frameworks only if they are actually central to the repo.
-- Do not mention Fermatix, Anthropic, suppliers, sampling, metadata, audits, pass/fail status, or internal delivery process.
+- Do not mention suppliers, sampling, metadata, audits, pass/fail status, or internal delivery process.
 - Do not make claims you cannot verify from the repository files.
 - Prefer concrete nouns over vague phrases like "various features" or "robust solution."
 

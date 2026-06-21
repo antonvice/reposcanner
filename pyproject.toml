@@ -1,7 +1,7 @@
 [project]
 name = "reposcanner"
 version = "0.1.0"
-description = "Repository metadata scanner for Fermatix-style code dataset stats"
+description = "Repository metadata scanner for code dataset stats"
 readme = "README.md"
 authors = [
     { name = "Anton Vice", email = "a1996nton@gmail.com" }
