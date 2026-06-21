@@ -1,0 +1,16 @@
+.venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# Local scanner outputs
+repo_metadata.json
+repo_metadata.jsonl
+repo_metadata.yaml
+repo_description.txt
