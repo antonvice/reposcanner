@@ -19,7 +19,6 @@ def scan(repo, output, **kwargs):
         "regression",
         include_token_stats=False,
         include_sale_prediction=False,
-        include_ai_detection=False,
         prep_sample=True,
         sample_output=str(output),
         **kwargs,

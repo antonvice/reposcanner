@@ -45,7 +45,6 @@ def test_primary_language_skips_non_primary_data_languages(tmp_path) -> None:
         "repo-id",
         include_token_stats=False,
         include_sale_prediction=False,
-        include_ai_detection=False,
         prep_sample=False,
         anonymize=False,
     )
@@ -78,7 +77,6 @@ def test_sample_zip_is_anonymized_by_default(tmp_path) -> None:
         "repo-id",
         include_token_stats=False,
         include_sale_prediction=False,
-        include_ai_detection=False,
         prep_sample=True,
         sample_output=str(out_dir),
         anonymize=True,
