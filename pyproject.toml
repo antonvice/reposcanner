@@ -1,6 +1,6 @@
 [project]
 name = "reposcanner"
-version = "0.1.0"
+version = "0.2.0"
 description = "Repository metadata scanner for code dataset stats"
 readme = "README.md"
 authors = [
@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "pygments>=2.20.0",
     "rich>=13.7.0",
 ]
 license = "MIT"

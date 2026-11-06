@@ -30,7 +30,7 @@ home = "/Users/janedoe/work"
     assert "[EMAIL_" in sanitized
     assert "[PHONE_" in sanitized
     assert "[URL_" in sanitized
-    assert "[SECRET]" in sanitized
+    assert "[SECRET_" in sanitized
     assert "[USER_" in sanitized
 
 
